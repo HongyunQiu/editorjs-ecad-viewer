@@ -1,60 +1,41 @@
-# editorjs-ecad-viewer
+# editorjs-ecad-viewer (monorepo)
 
-把 [ecad-viewer](https://github.com/HongyunQiu/ecad-viewer) 以 **Editor.js Block Tool** 的形式嵌入。
+已将 `ecad-viewer` 与 `editorjs-ecad-viewer` 合并为单仓多包，便于统一维护与一键构建。
 
-> 当前实现已升级为原生模式：直接加载 `ecad-viewer` web component，并在块内挂载 `ecad-viewer-embedded`（非 iframe）。
+## 目录结构
 
-## 功能
+- `packages/ecad-viewer`：ECAD 渲染内核
+- `packages/editorjs-ecad-viewer`：Editor.js Block Tool 封装
+- `scripts/build_dist_copy.mjs`：一键构建并复制产物（参考 `build_dist_copy` 工作流）
 
-- 在 Editor.js 中插入 `ECAD Viewer` 块
-- 原生挂载 `ecad-viewer-embedded`
-- 可配置：
-  - `viewerHostUrl`（默认 `http://localhost:8080/`）
-  - `moduleUrl`（默认 `${viewerHostUrl}/ecad_viewer/ecad-viewer.js`）
-  - `sourceUrl`（支持多个地址，分号 `;` 分隔）
-  - `isBom`（是否 BOM 视图）
-- 保存/回读为标准 Editor.js block data
-
-## 本地开发
+## 一键构建（两者同时）
 
 ```bash
 cd editorjs-ecad-viewer
 npm install
-npm run build
+npm run build:all
 ```
 
-构建产物：
+这会执行：
+1. 构建 `ecad-viewer`
+2. 构建 `editorjs-ecad-viewer`
+3. 复制产物到仓库根目录 `dist/`
+
+## 产物说明
+
 - `dist/ecadViewer.umd.js`
 - `dist/ecadViewer.mjs`
+- `dist/index.d.ts`
+- `dist/ecad_viewer/ecad-viewer.js`
 
-## 测试页
+> 兼容原有 `viewerHostUrl + /ecad_viewer/ecad-viewer.js` 的加载方式。
 
-打开：
-- `test/editor-test-simple.html`
+## 可选：自动复制到 QNotes vendor
 
-建议通过静态服务器访问页面（不要直接 file:// 打开）。
+如果存在以下目录，脚本会自动复制：
 
-## 在 Editor.js 中使用
+- `../qnotes/public/vendor/editorjs-ecad-viewer/`
 
-```js
-import EcadViewerTool from '@editorjs/ecad-viewer';
-
-const editor = new EditorJS({
-  tools: {
-    ecadViewer: {
-      class: EcadViewerTool,
-      config: {
-        defaultViewerHostUrl: 'http://localhost:8080/',
-        defaultSourceUrl: 'http://localhost:8080/video/video.kicad_pcb',
-        iframeHeight: 560,
-      },
-    },
-  },
-});
-```
-
-## 后续可升级
-
-- 支持上传本地 zip 并自动转临时 URL
-- 与 QNotes 附件系统打通（自动识别附件地址）
-- 优化只读模式加载体验与错误提示
+复制内容：
+- `ecadViewer.umd.js`
+- `ecad_viewer/ecad-viewer.js`
