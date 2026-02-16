@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Editor.js 测试 - ECAD Viewer Tool</title>
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    #editorjs { max-width: 980px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@editorjs/editorjs@latest"></script>
+  <script src="../dist/ecadViewer.umd.js"></script>
+</head>
+
+<body>
+  <h1>Editor.js + ECAD Viewer Tool</h1>
+  <div id="editorjs"></div>
+
+  <script>
+    const EcadViewerTool = window.EcadViewerTool && (window.EcadViewerTool.default || window.EcadViewerTool);
+    const origin = window.location.origin;
+    const viewerHost = `${origin}/`;
+    const moduleUrl = `${origin}/ecad_viewer/ecad-viewer.js`;
+    const sourceUrl = `${origin}/f10b1dde-1353-4aa0-976b-254e5f6d4a56.zip`;
+
+    const editor = new EditorJS({
+      holder: 'editorjs',
+      tools: {
+        ecadViewer: {
+          class: EcadViewerTool,
+          config: {
+            defaultViewerHostUrl: viewerHost,
+            defaultSourceUrl: sourceUrl,
+            iframeHeight: 560,
+          },
+        },
+      },
+      data: {
+        blocks: [
+          {
+            type: 'ecadViewer',
+            data: {
+              viewerHostUrl: viewerHost,
+              moduleUrl,
+              sourceUrl,
+              isBom: false,
+            },
+          },
+        ],
+      },
+    });
+
+    window.editor = editor;
+  </script>
+</body>
+
+</html>
