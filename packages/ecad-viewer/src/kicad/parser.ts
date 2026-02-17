@@ -358,7 +358,9 @@ export function parse_expr(expr: string | List, ...defs: PropertyDefinition[]) {
             def = defs_map.get(n);
 
             if (!def) {
-                log.warn(
+                // 解析器对部分 KiCad/EDA 扩展字段会出现“无定义”分支，这在实际渲染中通常可忽略，
+                // 但会造成控制台大量噪音。默认降级到 debug，需要排查时再提升日志级别即可。
+                log.debug(
                     `no def for bare element ${element} at position ${n} in expression ${expr}`,
                 );
                 continue;
@@ -373,7 +375,8 @@ export function parse_expr(expr: string | List, ...defs: PropertyDefinition[]) {
         }
 
         if (!def) {
-            log.warn(
+            // 同上：默认降级为 debug，避免刷屏
+            log.debug(
                 `No def found for element ${element} in expression ${expr}`,
             );
             continue;

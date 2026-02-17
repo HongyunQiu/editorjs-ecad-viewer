@@ -34,6 +34,78 @@ import "../ecad-viewer/ecad_viewer_global";
 
 const log = new Logger("kicanvas:project");
 
+type ProjectPageSnapshot = {
+    filename: string;
+    sheet_path: string;
+    name?: string;
+    page?: string;
+};
+
+type ProjectSnapshot = {
+    createdAt: number;
+    lastUsedAt: number;
+    // core
+    files_by_name: Map<string, KicadPCB | KicadSch>;
+    file_content: Map<string, string>;
+    pcb: KicadPCB[];
+    sch: KicadSch[];
+    ov_3d_url?: string;
+    bom_items: BomItem[];
+    label_name_refs: Map<string, NetRef[]>;
+    net_item_refs: Map<string, NetRef>;
+    designator_refs: Map<string, DesignatorRef>;
+    project_name: string;
+    settings: ProjectSettings;
+    active_sch_name?: string;
+    found_cjk: boolean;
+    // pages
+    root_page?: ProjectPageSnapshot;
+    pages: ProjectPageSnapshot[];
+};
+
+// 解析缓存：避免相同工程在 editor 重新创建组件时重复解析
+const PROJECT_CACHE_MAX = 3;
+const PROJECT_CACHE_TTL_MS = 10 * 60 * 1000; // 10min
+const projectSnapshotCache = new Map<string, ProjectSnapshot>();
+
+function nowMs(): number {
+    return Date.now();
+}
+
+function hashLite(s: string): string {
+    // 轻量 hash，避免把大内容塞进 key
+    let h = 5381;
+    const n = Math.min(s.length, 4096);
+    for (let i = 0; i < n; i++) {
+        h = ((h << 5) + h) ^ s.charCodeAt(i);
+    }
+    // include length to reduce collisions
+    return `${(h >>> 0).toString(16)}:${s.length}`;
+}
+
+function sourcesKey(sources: EcadSources): string {
+    const urlsKey = (sources.urls ?? []).join("|");
+    const blobsKey = (sources.blobs ?? [])
+        .map((b) => `${b.filename}:${hashLite(String(b.content ?? ""))}`)
+        .join("|");
+    return `u:${urlsKey}#b:${blobsKey}`;
+}
+
+function evictProjectCacheIfNeeded() {
+    const t = nowMs();
+    for (const [k, v] of projectSnapshotCache) {
+        if (t - v.lastUsedAt > PROJECT_CACHE_TTL_MS) projectSnapshotCache.delete(k);
+    }
+    if (projectSnapshotCache.size <= PROJECT_CACHE_MAX) return;
+    const items = Array.from(projectSnapshotCache.entries()).sort(
+        (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
+    );
+    while (projectSnapshotCache.size > PROJECT_CACHE_MAX && items.length) {
+        const victim = items.shift()!;
+        projectSnapshotCache.delete(victim[0]);
+    }
+}
+
 export enum AssertType {
     SCH,
     PCB,
@@ -118,6 +190,63 @@ export class Project extends EventTarget implements IDisposable {
     }
 
     public async load(sources: EcadSources) {
+        const key = sourcesKey(sources);
+        const cached = projectSnapshotCache.get(key);
+        if (cached && nowMs() - cached.lastUsedAt <= PROJECT_CACHE_TTL_MS) {
+            cached.lastUsedAt = nowMs();
+            evictProjectCacheIfNeeded();
+
+            // Reset current state
+            this.dispose();
+            this._fs = new FetchFileSystem(sources.urls);
+
+            this._files_by_name = new Map(cached.files_by_name);
+            this._file_content = new Map(cached.file_content);
+            this._pcb = Array.from(cached.pcb);
+            this._sch = Array.from(cached.sch);
+            this._ov_3d_url = cached.ov_3d_url;
+            this._bom_items = Array.from(cached.bom_items);
+            this._label_name_refs = new Map(cached.label_name_refs);
+            this._net_item_refs = new Map(cached.net_item_refs);
+            this._designator_refs = new Map(cached.designator_refs);
+            this._project_name = cached.project_name;
+            this.settings = cached.settings;
+            this.active_sch_name = cached.active_sch_name as any;
+            this._found_cjk = cached.found_cjk;
+
+            this._pages_by_path = new Map();
+            for (const p of cached.pages) {
+                const page = new ProjectPage(
+                    this,
+                    p.filename,
+                    p.sheet_path,
+                    p.name,
+                    p.page,
+                );
+                this._pages_by_path.set(page.project_path, page);
+            }
+            if (cached.root_page) {
+                const rp = new ProjectPage(
+                    this,
+                    cached.root_page.filename,
+                    cached.root_page.sheet_path,
+                    cached.root_page.name,
+                    cached.root_page.page,
+                );
+                this._root_schematic_page = rp;
+            } else {
+                this._root_schematic_page = undefined;
+            }
+
+            this.loaded.open();
+            this.dispatchEvent(
+                new CustomEvent("load", {
+                    detail: this,
+                }),
+            );
+            return;
+        }
+
         this._fs = new FetchFileSystem(sources.urls);
 
         const promises = [];
@@ -187,6 +316,43 @@ export class Project extends EventTarget implements IDisposable {
                 detail: this,
             }),
         );
+
+        // 写入解析缓存（用于 editor 重建时复用）
+        try {
+            const snap: ProjectSnapshot = {
+                createdAt: nowMs(),
+                lastUsedAt: nowMs(),
+                files_by_name: new Map(this._files_by_name),
+                file_content: new Map(this._file_content),
+                pcb: Array.from(this._pcb),
+                sch: Array.from(this._sch),
+                ov_3d_url: this._ov_3d_url,
+                bom_items: Array.from(this._bom_items),
+                label_name_refs: new Map(this._label_name_refs),
+                net_item_refs: new Map(this._net_item_refs),
+                designator_refs: new Map(this._designator_refs),
+                project_name: this._project_name,
+                settings: this.settings,
+                active_sch_name: this.active_sch_name,
+                found_cjk: this._found_cjk,
+                root_page: this._root_schematic_page
+                    ? {
+                          filename: this._root_schematic_page.filename,
+                          sheet_path: this._root_schematic_page.sheet_path,
+                          name: this._root_schematic_page.name,
+                          page: this._root_schematic_page.page,
+                      }
+                    : undefined,
+                pages: Array.from(this._pages_by_path.values()).map((p) => ({
+                    filename: p.filename,
+                    sheet_path: p.sheet_path,
+                    name: p.name,
+                    page: p.page,
+                })),
+            };
+            projectSnapshotCache.set(key, snap);
+            evictProjectCacheIfNeeded();
+        } catch (_) {}
     }
 
     _sort_bom(bom_list: BomItem[]) {

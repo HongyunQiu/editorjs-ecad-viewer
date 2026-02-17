@@ -6,7 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build:no-check -w ecad-viewer && npm run build -w @editorjs/ecad-viewer",
+    "build": "npm run build:no-check -w ecad-viewer && npm run build:3d -w ecad-viewer && npm run build:glyph -w ecad-viewer && npm run build -w @editorjs/ecad-viewer",
     "build_dist_copy": "node scripts/build_dist_copy.mjs",
     "build:all": "npm run build && npm run build_dist_copy"
   }

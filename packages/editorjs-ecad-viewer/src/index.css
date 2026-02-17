@@ -5,17 +5,30 @@
   background: #fff;
 }
 
-.cdx-ecad-viewer__controls {
-  display: grid;
-  gap: 8px;
+.cdx-ecad-viewer__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin-bottom: 10px;
 }
 
-.cdx-ecad-viewer__input {
+.cdx-ecad-viewer__btn {
+  appearance: none;
   border: 1px solid #cbd5e1;
   border-radius: 8px;
-  padding: 8px 10px;
+  padding: 7px 12px;
   font-size: 12px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.cdx-ecad-viewer__btn:hover {
+  background: #f8fafc;
+}
+
+.cdx-ecad-viewer__btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .cdx-ecad-viewer__preview {

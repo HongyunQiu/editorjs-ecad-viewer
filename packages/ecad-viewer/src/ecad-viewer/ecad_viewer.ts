@@ -428,7 +428,10 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         }
     }
     get has_3d() {
-        return this.#project.has_boards || this.#project.has_3d;
+        // 只有确实存在 3D 模型来源时才显示 3D 页签：
+        // - Project.has_3d 由 ov_3d_url 或 design_urls.glb_url 决定
+        // 之前将 has_boards 也算入 has_3d 会导致“仅 PCB 无 glb”时 3D 页签一直转圈。
+        return this.#project.has_3d;
     }
     get has_pcb() {
         return this.#project.has_boards;
@@ -512,8 +515,13 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                 if (this.#ov_d_app) this.#ov_d_app.on_show();
                 else {
                     (async () => {
-                        // @ts-expect-error its imported from map
-                        await import("3d-viewer");
+                        // 3D viewer 在运行时按需加载。
+                        // 旧实现依赖 importmap 将裸模块名 "3d-viewer" 映射到实际文件；
+                        // 在 QNotes 的 vendor 静态环境下更稳妥的方式是使用相对 URL。
+                        const modUrl = new URL("./3d-viewer.js", import.meta.url).toString();
+                        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+                        // @ts-ignore dynamic import by url
+                        await import(/* @vite-ignore */ modUrl);
                         this.#ov_d_app =
                             html`<ecad-3d-viewer></ecad-3d-viewer>` as Online3dViewer;
                         this.#viewers_container.appendChild(this.#ov_d_app);
