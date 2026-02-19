@@ -1,0 +1,74 @@
+0000	40 65 63 68 6f 20 6f 66  66 0a 73 65 74 6c 6f 63   @echo off.setloc
+0010	61 6c 20 65 6e 61 62 6c  65 64 65 6c 61 79 65 64   al enabledelayed
+0020	65 78 70 61 6e 73 69 6f  6e 0a 63 68 63 70 20 36   expansion.chcp 6
+0030	35 30 30 31 20 3e 6e 75  6c 0a 65 63 68 6f 20 e5   5001 >nul.echo .
+0040	bc 80 e5 a7 8b e6 9e 84  e5 bb ba ef bc 88 65 63   ..............ec
+0050	61 64 2d 76 69 65 77 65  72 20 2b 20 65 64 69 74   ad-viewer + edit
+0060	6f 72 6a 73 2d 65 63 61  64 2d 76 69 65 77 65 72   orjs-ecad-viewer
+0070	ef bc 89 e5 b9 b6 e5 a4  8d e5 88 b6 e4 ba a7 e7   ................
+0080	89 a9 2e 2e 2e 0a 0a 52  45 4d 20 e7 a1 ae e4 bf   .......REM .....
+0090	9d e4 be 9d e8 b5 96 e5  b7 b2 e5 ae 89 e8 a3 85   ................
+00a0	ef bc 88 6d 6f 6e 6f 72  65 70 6f 20 77 6f 72 6b   ...monorepo work
+00b0	73 70 61 63 65 20 e4 be  9d e8 b5 96 e5 9c a8 e6   space ..........
+00c0	a0 b9 e7 9b ae e5 bd 95  e5 ae 89 e8 a3 85 ef bc   ................
+00d0	89 0a 69 66 20 6e 6f 74  20 65 78 69 73 74 20 22   ..if not exist "
+00e0	6e 6f 64 65 5f 6d 6f 64  75 6c 65 73 5c 65 73 62   node_modules\esb
+00f0	75 69 6c 64 22 20 28 0a  20 20 65 63 68 6f 20 e6   uild" (.  echo .
+0100	9c aa e6 a3 80 e6 b5 8b  e5 88 b0 e4 be 9d e8 b5   ................
+0110	96 ef bc 88 6e 6f 64 65  5f 6d 6f 64 75 6c 65 73   ....node_modules
+0120	2f 65 73 62 75 69 6c 64  ef bc 89 ef bc 8c e5 85   /esbuild........
+0130	88 e6 89 a7 e8 a1 8c 20  6e 70 6d 20 69 6e 73 74   ....... npm inst
+0140	61 6c 6c 20 2e 2e 2e 0a  20 20 63 61 6c 6c 20 6e   all ....  call n
+0150	70 6d 20 69 6e 73 74 61  6c 6c 0a 20 20 73 65 74   pm install.  set
+0160	20 49 4e 53 54 41 4c 4c  5f 52 45 53 55 4c 54 3d    INSTALL_RESULT=
+0170	21 45 52 52 4f 52 4c 45  56 45 4c 21 0a 20 20 69   !ERRORLEVEL!.  i
+0180	66 20 21 49 4e 53 54 41  4c 4c 5f 52 45 53 55 4c   f !INSTALL_RESUL
+0190	54 21 20 4e 45 51 20 30  20 28 0a 20 20 20 20 65   T! NEQ 0 (.    e
+01a0	63 68 6f 20 6e 70 6d 20  69 6e 73 74 61 6c 6c 20   cho npm install 
+01b0	e5 a4 b1 e8 b4 a5 ef bc  81 e9 94 99 e8 af af e4   ................
+01c0	bb a3 e7 a0 81 3a 20 21  49 4e 53 54 41 4c 4c 5f   .....: !INSTALL_
+01d0	52 45 53 55 4c 54 21 0a  20 20 20 20 65 78 69 74   RESULT!.    exit
+01e0	20 2f 62 20 21 49 4e 53  54 41 4c 4c 5f 52 45 53    /b !INSTALL_RES
+01f0	55 4c 54 21 0a 20 20 29  0a 29 0a 0a 63 61 6c 6c   ULT!.  ).)..call
+0200	20 6e 70 6d 20 72 75 6e  20 62 75 69 6c 64 3a 61    npm run build:a
+0210	6c 6c 0a 73 65 74 20 42  55 49 4c 44 5f 52 45 53   ll.set BUILD_RES
+0220	55 4c 54 3d 21 45 52 52  4f 52 4c 45 56 45 4c 21   ULT=!ERRORLEVEL!
+0230	0a 69 66 20 21 42 55 49  4c 44 5f 52 45 53 55 4c   .if !BUILD_RESUL
+0240	54 21 20 4e 45 51 20 30  20 28 0a 20 20 65 63 68   T! NEQ 0 (.  ech
+0250	6f 20 e6 9e 84 e5 bb ba  e5 a4 b1 e8 b4 a5 ef bc   o ..............
+0260	81 e9 94 99 e8 af af e4  bb a3 e7 a0 81 3a 20 21   .............: !
+0270	42 55 49 4c 44 5f 52 45  53 55 4c 54 21 0a 20 20   BUILD_RESULT!.  
+0280	65 78 69 74 20 2f 62 20  21 42 55 49 4c 44 5f 52   exit /b !BUILD_R
+0290	45 53 55 4c 54 21 0a 29  0a 0a 52 45 4d 20 e5 8f   ESULT!.)..REM ..
+02a0	af e9 80 89 ef bc 9a e6  a0 a1 e9 aa 8c 20 51 4e   ............. QN
+02b0	6f 74 65 73 20 76 65 6e  64 6f 72 20 e5 a4 8d e5   otes vendor ....
+02c0	88 b6 e7 bb 93 e6 9e 9c  ef bc 88 e5 a6 82 e6 9e   ................
+02d0	9c e5 b7 a5 e7 a8 8b e7  9b ae e5 bd 95 e5 ad 98   ................
+02e0	e5 9c a8 ef bc 89 0a 69  66 20 65 78 69 73 74 20   .......if exist 
+02f0	22 2e 2e 5c 2e 2e 5c 51  4e 6f 74 65 73 5c 70 75   "..\..\QNotes\pu
+0300	62 6c 69 63 22 20 28 0a  20 20 69 66 20 6e 6f 74   blic" (.  if not
+0310	20 65 78 69 73 74 20 22  2e 2e 5c 2e 2e 5c 51 4e    exist "..\..\QN
+0320	6f 74 65 73 5c 70 75 62  6c 69 63 5c 76 65 6e 64   otes\public\vend
+0330	6f 72 5c 65 64 69 74 6f  72 6a 73 2d 65 63 61 64   or\editorjs-ecad
+0340	2d 76 69 65 77 65 72 5c  65 63 61 64 56 69 65 77   -viewer\ecadView
+0350	65 72 2e 75 6d 64 2e 6a  73 22 20 28 0a 20 20 20   er.umd.js" (.   
+0360	20 65 63 68 6f 20 e8 ad  a6 e5 91 8a ef bc 9a e6    echo ..........
+0370	9c aa e5 8f 91 e7 8e b0  20 51 4e 6f 74 65 73 2f   ........ QNotes/
+0380	76 65 6e 64 6f 72 20 e4  ba a7 e7 89 a9 ef bc 9a   vendor .........
+0390	76 65 6e 64 6f 72 5c 65  64 69 74 6f 72 6a 73 2d   vendor\editorjs-
+03a0	65 63 61 64 2d 76 69 65  77 65 72 5c 65 63 61 64   ecad-viewer\ecad
+03b0	56 69 65 77 65 72 2e 75  6d 64 2e 6a 73 0a 20 20   Viewer.umd.js.  
+03c0	29 0a 20 20 69 66 20 6e  6f 74 20 65 78 69 73 74   ).  if not exist
+03d0	20 22 2e 2e 5c 2e 2e 5c  51 4e 6f 74 65 73 5c 70    "..\..\QNotes\p
+03e0	75 62 6c 69 63 5c 76 65  6e 64 6f 72 5c 65 64 69   ublic\vendor\edi
+03f0	74 6f 72 6a 73 2d 65 63  61 64 2d 76 69 65 77 65   torjs-ecad-viewe
+0400	72 5c 65 63 61 64 5f 76  69 65 77 65 72 5c 65 63   r\ecad_viewer\ec
+0410	61 64 2d 76 69 65 77 65  72 2e 6a 73 22 20 28 0a   ad-viewer.js" (.
+0420	20 20 20 20 65 63 68 6f  20 e8 ad a6 e5 91 8a ef       echo .......
+0430	bc 9a e6 9c aa e5 8f 91  e7 8e b0 20 51 4e 6f 74   ........... QNot
+0440	65 73 2f 76 65 6e 64 6f  72 20 e4 ba a7 e7 89 a9   es/vendor ......
+0450	ef bc 9a 76 65 6e 64 6f  72 5c 65 64 69 74 6f 72   ...vendor\editor
+0460	6a 73 2d 65 63 61 64 2d  76 69 65 77 65 72 5c 65   js-ecad-viewer\e
+0470	63 61 64 5f 76 69 65 77  65 72 5c 65 63 61 64 2d   cad_viewer\ecad-
+0480	76 69 65 77 65 72 2e 6a  73 0a 20 20 29 0a 29 0a   viewer.js.  ).).
+0490	65 63 68 6f 20 e5 ae 8c  e6 88 90 e3 80 82 0a      echo ..........
