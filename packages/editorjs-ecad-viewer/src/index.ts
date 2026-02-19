@@ -6,6 +6,11 @@ export interface EcadViewerData {
   sourceUrl: string;
   isBom?: boolean;
   moduleUrl?: string;
+  /**
+   * Viewer UI 状态快照（例如 PCB 层可见性、透明度滑块、对象可见性等）。
+   * 由 `<ecad-viewer>` 在编辑时通过事件上报，存入 Editor.js block data，便于下次打开自动恢复。
+   */
+  viewState?: any;
 }
 
 export interface EcadViewerConfig extends ToolConfig {
@@ -160,6 +165,7 @@ export default class EcadViewerTool implements BlockTool {
   private openBtn?: HTMLButtonElement;
   private hintEl?: HTMLElement;
   private mountEl?: HTMLElement;
+  private currentViewerEl?: HTMLElement;
 
   static get isReadOnlySupported() {
     return true;
@@ -183,6 +189,7 @@ export default class EcadViewerTool implements BlockTool {
       sourceUrl: data?.sourceUrl || this.config.defaultSourceUrl || '',
       isBom: typeof data?.isBom === 'boolean' ? data.isBom : !!this.config.defaultIsBom,
       moduleUrl: data?.moduleUrl || toModuleUrl(host),
+      viewState: (data as any)?.viewState,
     };
   }
 
@@ -251,6 +258,7 @@ export default class EcadViewerTool implements BlockTool {
       moduleUrl: this.data.moduleUrl || toModuleUrl(this.data.viewerHostUrl),
       sourceUrl: this.data.sourceUrl || '',
       isBom: !!this.data.isBom,
+      viewState: this.data.viewState,
     };
   }
 
@@ -369,6 +377,7 @@ export default class EcadViewerTool implements BlockTool {
     const height = this.config.iframeHeight || 560;
 
     this.mountEl.innerHTML = '';
+    this.currentViewerEl = undefined;
 
     let viewer: HTMLElement;
     try {
@@ -382,6 +391,7 @@ export default class EcadViewerTool implements BlockTool {
 
       // 统一使用完整 ecad-viewer（自带 PCB/SCH/BOM/3D 标签页，可切换）
       viewer = safeCreateElement('ecad-viewer');
+      this.currentViewerEl = viewer;
       viewer.setAttribute('style', `display:block;width:100%;height:${height}px;border:0;`);
       // 如需默认打开 BOM，可通过全局 default_page 控制（ecad-viewer 会读取 window.default_page）
       try {
@@ -475,6 +485,33 @@ export default class EcadViewerTool implements BlockTool {
           throw new Error(`加载超时（${Math.round(timeoutMs / 1000)}s）`);
         })(),
       ]);
+
+      // 恢复已保存的 viewer UI 状态（例如层可见性/透明度等）。
+      // 注意：这里先回放状态，再绑定事件监听，避免“初始化回放”把 block 标记为已修改。
+      try {
+        const state = (this.data as any)?.viewState;
+        if (state && typeof anyViewer?.setViewState === 'function') {
+          await anyViewer.setViewState(state);
+        } else if (state && anyViewer) {
+          // 兜底：部分构建版本可能暴露为属性而非方法
+          (anyViewer as any).viewState = state;
+        }
+      } catch (e) {
+        console.warn('[ECAD] restore viewState failed:', e);
+      }
+
+      // 监听 viewer UI 状态变化并写回 block data，保证下次打开可恢复
+      try {
+        const el = viewer as any;
+        el.addEventListener?.('ecad-viewer:view-state-change', (ev: any) => {
+          try {
+            const next = ev?.detail?.viewState ?? ev?.detail ?? null;
+            if (!next) return;
+            (this.data as any).viewState = next;
+            this.dispatchEditorChange();
+          } catch (_) {}
+        });
+      } catch (_) {}
     } catch (e) {
       console.warn('[ECAD] viewer load failed:', e);
       const msg = e instanceof Error ? e.message : String(e);

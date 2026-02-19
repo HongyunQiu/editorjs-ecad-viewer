@@ -38,6 +38,7 @@ export class BoardViewer extends DocumentViewer<
     #should_restore_visibility = false;
     #zones_visibility = new Map<string, VisibilityType>();
     #layer_visibility_ctrl: KCBoardLayersPanelElement;
+    #focused_net: number | null = null;
 
     set layer_visibility_ctrl(ctr: KCBoardLayersPanelElement) {
         this.#layer_visibility_ctrl = ctr;
@@ -48,9 +49,12 @@ export class BoardViewer extends DocumentViewer<
             this.#should_restore_visibility = false;
             if (num) {
                 this.#should_restore_visibility = true;
+                this.#focused_net = num;
                 for (const layer of this.layers.in_ui_order()) {
                     layer.visible = false;
                 }
+            } else {
+                this.#focused_net = null;
             }
             this.draw();
         }
@@ -66,6 +70,30 @@ export class BoardViewer extends DocumentViewer<
             );
         }
     }
+
+    /**
+     * 清除当前 net focus（恢复图层可见性、清 interactive），并派发事件通知外部状态已变为“未选中”。
+     */
+    public clear_net_focus() {
+        if (this.#should_restore_visibility) {
+            const visibilities = this.layer_visibility;
+            for (const layer of this.layers.in_ui_order()) {
+                layer.visible = visibilities.get(layer.name)!;
+            }
+            this.#should_restore_visibility = false;
+            this.#focused_net = null;
+            this.painter.clear_interactive();
+            this.draw();
+        }
+        // 通知外部：当前没有任何 net 被选中
+        try {
+            this.dispatchEvent(
+                new CustomEvent("kicanvas:net-focus-change", {
+                    detail: { netNumber: null },
+                }),
+            );
+        } catch (_) {}
+    }
     protected override on_document_clicked(): void {
         if (this.#should_restore_visibility) {
             const visibilities = this.layer_visibility;
@@ -73,8 +101,18 @@ export class BoardViewer extends DocumentViewer<
                 layer.visible = visibilities.get(layer.name)!;
             }
             this.#should_restore_visibility = false;
+            this.#focused_net = null;
             this.painter.clear_interactive();
             this.draw();
+
+            // 点击空白/其它元素导致 net focus 被取消：上报给外部用于持久化
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("kicanvas:net-focus-change", {
+                        detail: { netNumber: null },
+                    }),
+                );
+            } catch (_) {}
         }
 
         if (this.#zones_visibility.size) {

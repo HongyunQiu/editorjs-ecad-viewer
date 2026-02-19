@@ -134,9 +134,26 @@ export abstract class Viewer extends EventTarget {
                     this.on_dblclick(this.#mouse_position);
                 }),
             );
-            document.addEventListener("click", () => {
-                this.on_document_clicked();
-            });
+            // 只在点击发生在当前 viewer 的 canvas 内时才触发 on_document_clicked()。
+            // 旧实现监听 document 的全局 click，会导致点击宿主应用（例如 QNotes 的“提交”按钮）
+            // 也触发清理逻辑，从而把 net focus/highlight 等状态意外清掉；同时也会造成监听泄漏。
+            this.disposables.add(
+                listen(document, "click", (e) => {
+                    try {
+                        const target = e.target as Node | null;
+                        const inCanvas =
+                            !!target && this.canvas.contains(target as any);
+                        if (inCanvas) {
+                            this.on_document_clicked();
+                            return;
+                        }
+                        const path = (e as any).composedPath?.();
+                        if (Array.isArray(path) && path.includes(this.canvas)) {
+                            this.on_document_clicked();
+                        }
+                    } catch (_) {}
+                }),
+            );
         }
 
         this.setup_finished.open();

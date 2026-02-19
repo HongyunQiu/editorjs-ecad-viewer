@@ -14,6 +14,8 @@ import {
 import { LayerNames, LayerSet } from "../../../viewers/board/layers";
 import { BoardViewer } from "../../../viewers/board/viewer";
 
+const BOARD_LAYER_VIS_CHANGE_EVENT = "ecad-viewer:board-layer-visibility-change";
+
 export class KCBoardLayersPanelElement extends KCUIElement {
     static override styles = [
         ...KCUIElement.styles,
@@ -63,6 +65,7 @@ export class KCBoardLayersPanelElement extends KCUIElement {
     ];
 
     viewer: BoardViewer;
+    #pending_visibilities: Record<string, boolean> | null = null;
 
     public get visibilities() {
         const res: Map<string, boolean> = new Map();
@@ -95,7 +98,65 @@ export class KCBoardLayersPanelElement extends KCUIElement {
             this.viewer = await this.requestLazyContext("viewer");
             await this.viewer.loaded;
             super.connectedCallback();
+            this.#apply_pending_visibilities();
         })();
+    }
+
+    /**
+     * 以 layerName -> visible 的形式批量设置 PCB 层可见性。
+     * 用于外部（例如 Editor.js block）恢复用户上次的视图设置。
+     */
+    public setVisibilities(vis: Record<string, boolean>) {
+        this.#pending_visibilities = vis || {};
+        this.#apply_pending_visibilities();
+    }
+
+    private #apply_pending_visibilities() {
+        if (!this.#pending_visibilities) return;
+        if (!this.viewer || !this.panel_body) return;
+
+        const vis = this.#pending_visibilities;
+        this.#pending_visibilities = null;
+
+        const ui_layers = this.viewer.layers.in_ui_order();
+        for (const l of ui_layers) {
+            if (Object.prototype.hasOwnProperty.call(vis, l.name)) {
+                l.visible = !!vis[l.name];
+            }
+        }
+
+        // 同步 UI 控件状态
+        for (const item of this.items) {
+            if (Object.prototype.hasOwnProperty.call(vis, item.layer_name)) {
+                item.layer_visible = !!vis[item.layer_name];
+                item.layer_highlighted = false;
+            }
+        }
+
+        // 视为“自定义显示”，取消 presets 选中
+        try {
+            this.presets_menu?.deselect();
+        } catch (_) {}
+
+        this.viewer.draw();
+        this.#emit_visibility_change();
+    }
+
+    private #emit_visibility_change() {
+        try {
+            const layerVisibility = Object.fromEntries(this.visibilities);
+            this.dispatchEvent(
+                new CustomEvent(BOARD_LAYER_VIS_CHANGE_EVENT, {
+                    detail: { layerVisibility },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        } catch (_) {}
+    }
+
+    override renderedCallback(): void | undefined {
+        this.#apply_pending_visibilities();
     }
 
     clear_highlight() {
@@ -134,6 +195,7 @@ export class KCBoardLayersPanelElement extends KCUIElement {
                 }
 
                 this.viewer.draw();
+                this.#emit_visibility_change();
             },
         );
 
@@ -154,6 +216,7 @@ export class KCBoardLayersPanelElement extends KCUIElement {
                 this.presets_menu.deselect();
 
                 this.viewer.draw();
+                this.#emit_visibility_change();
             },
         );
 
@@ -183,6 +246,7 @@ export class KCBoardLayersPanelElement extends KCUIElement {
                 this.presets_menu.deselect();
 
                 this.update_item_states();
+                this.#emit_visibility_change();
             });
 
         // Presets
@@ -243,6 +307,7 @@ export class KCBoardLayersPanelElement extends KCUIElement {
 
             this.viewer.draw();
             this.update_item_states();
+            this.#emit_visibility_change();
         });
     }
 

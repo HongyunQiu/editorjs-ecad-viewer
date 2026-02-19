@@ -16,6 +16,9 @@ enum ObjVisibilities {
     Hidden_Txt = "Hidden Text",
 }
 
+const BOARD_OBJECT_VIS_CHANGE_EVENT =
+    "ecad-viewer:board-object-visibility-change";
+
 export class ObjVisibilityCtrlList extends KCUIElement {
     static override styles = [
         ...KCUIElement.styles,
@@ -33,6 +36,7 @@ export class ObjVisibilityCtrlList extends KCUIElement {
     ];
 
     viewer: BoardViewer;
+    #pending_object_visibilities: Record<string, boolean> | null = null;
 
     public constructor() {
         super();
@@ -44,7 +48,118 @@ export class ObjVisibilityCtrlList extends KCUIElement {
             this.viewer = await this.requestLazyContext("viewer");
             await this.viewer.loaded;
             super.connectedCallback();
+            this.#apply_pending_object_visibilities();
         })();
+    }
+
+    override renderedCallback(): void | undefined {
+        this.#apply_pending_object_visibilities();
+    }
+
+    /**
+     * 批量设置对象可见性（例如 Reference/Values/Footprint Text/Hidden Text）。
+     * 用于外部恢复 UI 状态。
+     */
+    public setObjectVisibilities(vis: Record<string, boolean>) {
+        this.#pending_object_visibilities = vis || {};
+        this.#apply_pending_object_visibilities();
+    }
+
+    private #emit_object_visibility_change() {
+        try {
+            const current: Record<string, boolean> = {};
+            const ctrls = Array.from(
+                (this.shadowRoot || this.renderRoot)?.querySelectorAll(
+                    "ecad-visibility-ctrl",
+                ) ?? [],
+            ) as any[];
+            for (const c of ctrls) {
+                const name = String(c.obj_name ?? "");
+                if (!name) continue;
+                current[name] = !!c.obj_visible;
+            }
+            this.dispatchEvent(
+                new CustomEvent(BOARD_OBJECT_VIS_CHANGE_EVENT, {
+                    detail: { objectVisibilities: current },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        } catch (_) {}
+    }
+
+    private #apply_one(obj_name: string, visible: boolean) {
+        const layers = this.viewer.layers as LayerSet;
+        const p = !!visible;
+
+        switch (obj_name) {
+            case ObjVisibilities.FP_Reference:
+                for (const it of layers.fp_reference_txt_layers())
+                    if (it) it.opacity = p ? 1 : 0;
+                break;
+            case ObjVisibilities.FP_Txt:
+                for (const it of layers.fp_txt_layers()) {
+                    if (it) it.opacity = p ? 1 : 0;
+                }
+                // 同步 Values/Reference 两项（它们属于 Footprint Text 的子集）
+                (this.shadowRoot || this.renderRoot)
+                    ?.querySelectorAll("ecad-visibility-ctrl")
+                    ?.forEach((e) => {
+                        const b = e as any as ObjVisibilityCtrl;
+                        if (
+                            b.obj_name === ObjVisibilities.FP_Reference ||
+                            b.obj_name === ObjVisibilities.FP_Values
+                        ) {
+                            b.obj_visible = p;
+                        }
+                    });
+                break;
+            case ObjVisibilities.FP_Values:
+                for (const it of layers.fp_value_txt_layers()) {
+                    if (it) it.opacity = p ? 1 : 0;
+                }
+                break;
+            case ObjVisibilities.Hidden_Txt:
+                for (const it of layers.hidden_txt_layers()) {
+                    if (it) it.opacity = p ? 1 : 0;
+                }
+                break;
+        }
+
+        this.viewer.draw();
+    }
+
+    private #apply_pending_object_visibilities() {
+        if (!this.#pending_object_visibilities) return;
+        if (!this.viewer) return;
+
+        // 需要等到控件渲染出来再应用，否则 querySelectorAll 拿不到子控件
+        const root = this.shadowRoot || this.renderRoot;
+        const ctrls = root?.querySelectorAll("ecad-visibility-ctrl");
+        if (!ctrls || ctrls.length === 0) return;
+
+        const vis = this.#pending_object_visibilities;
+        this.#pending_object_visibilities = null;
+
+        // 先设置控件状态，再批量应用到 viewer
+        for (const el of Array.from(ctrls) as any[]) {
+            const name = String(el.obj_name ?? "");
+            if (!name) continue;
+            if (Object.prototype.hasOwnProperty.call(vis, name)) {
+                el.obj_visible = !!vis[name];
+            }
+        }
+
+        // 再按既定逻辑同步到图层 opacity（会处理 FP_Txt 的级联）
+        for (const el of Array.from(ctrls) as any[]) {
+            const name = String(el.obj_name ?? "");
+            if (!name) continue;
+            if (Object.prototype.hasOwnProperty.call(vis, name)) {
+                this.#apply_one(name, !!vis[name]);
+            }
+        }
+
+        this.#emit_object_visibility_change();
     }
 
     override initialContentCallback() {
@@ -54,56 +169,9 @@ export class ObjVisibilityCtrlList extends KCUIElement {
             (e) => {
                 const item = (e as CustomEvent).detail as ObjVisibilityCtrl;
 
-                const layers = this.viewer.layers as LayerSet;
-
                 item.obj_visible = !item.obj_visible;
-                const p = item.obj_visible;
-
-                switch (item.obj_name) {
-                    case ObjVisibilities.FP_Reference:
-                        {
-                            for (const it of layers.fp_reference_txt_layers())
-                                if (it) it.opacity = p ? 1 : 0;
-                        }
-                        break;
-                    case ObjVisibilities.FP_Txt:
-                        {
-                            for (const it of layers.fp_txt_layers()) {
-                                if (it) it.opacity = p ? 1 : 0;
-                            }
-
-                            this.shadowRoot!.querySelectorAll(
-                                "ecad-visibility-ctrl",
-                            ).forEach((e) => {
-                                const b = e as ObjVisibilityCtrl;
-
-                                if (
-                                    b.obj_name ===
-                                        ObjVisibilities.FP_Reference ||
-                                    b.obj_name === ObjVisibilities.FP_Values
-                                ) {
-                                    b.obj_visible = p;
-                                }
-                            });
-                        }
-                        break;
-                    case ObjVisibilities.FP_Values:
-                        {
-                            for (const it of layers.fp_value_txt_layers()) {
-                                if (it) it.opacity = p ? 1 : 0;
-                            }
-                        }
-                        break;
-                    case ObjVisibilities.Hidden_Txt:
-                        {
-                            for (const it of layers.hidden_txt_layers()) {
-                                if (it) it.opacity = p ? 1 : 0;
-                            }
-                        }
-                        break;
-                }
-
-                this.viewer.draw();
+                this.#apply_one(item.obj_name, item.obj_visible);
+                this.#emit_object_visibility_change();
             },
         );
     }

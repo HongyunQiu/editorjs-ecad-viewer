@@ -19,6 +19,7 @@ import { is_3d_model, is_kicad, TabHeaderElement } from "./tab_header";
 import {
     BoardContentReady,
     CommentClickEvent,
+    KiCanvasSelectEvent,
     Online3dViewerLoaded,
     OpenBarrierEvent,
     SheetLoadEvent,
@@ -26,6 +27,7 @@ import {
     TabMenuClickEvent,
     TabMenuVisibleChangeEvent,
 } from "../viewers/base/events";
+import { KicadPCB } from "../kicad";
 
 export {
     CommentClickEvent,
@@ -43,6 +45,43 @@ import { ZipUtils } from "../utils/zip_utils";
 import { length } from "../base/iterator";
 import { HQ_LOGO } from "../kc-ui/hq_logo";
 
+export type EcadViewerPcbObjectsViewState = {
+    tracksOpacity?: number;
+    viasOpacity?: number;
+    padsOpacity?: number;
+    zonesOpacity?: number;
+    gridOpacity?: number;
+    pageOpacity?: number;
+    highlightTrack?: boolean;
+    objectVisibilities?: Record<string, boolean>;
+};
+
+export type EcadViewerViewState = {
+    /** 当前激活页签（pcb/sch/bom/step） */
+    activeTab?: TabKind;
+    pcb?: {
+        /** PCB 图层可见性快照 */
+        layers?: Record<string, boolean>;
+        /** Objects 面板的 UI 设置（透明度、开关等） */
+        objects?: EcadViewerPcbObjectsViewState;
+        /** Nets 面板的 UI 设置（例如搜索过滤文本） */
+        nets?: {
+            filterText?: string | null;
+            selectedNetNumber?: number | null;
+        };
+    };
+};
+
+function cloneViewState(v: EcadViewerViewState): EcadViewerViewState {
+    try {
+        // structuredClone 在部分环境可能不可用
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        if (typeof structuredClone === "function") return structuredClone(v);
+    } catch (_) {}
+    return JSON.parse(JSON.stringify(v || {}));
+}
+
 export class ECadViewer extends KCUIElement implements InputContainer {
     static override styles = [
         ...KCUIElement.styles,
@@ -51,9 +90,21 @@ export class ECadViewer extends KCUIElement implements InputContainer {
             :host(.full-window) {
                 width: 100vw; /* Full width of the viewport */
                 height: 100vh; /* Full height of the viewport */
-                top: 0px;
-                left: 0px;
+                max-height: none;
+                aspect-ratio: auto;
+                margin: 0;
                 position: fixed;
+                inset: 0;
+                z-index: 2147483647; /* 盖过 QNotes 顶部栏等 UI（对齐 Excalidraw 思路） */
+            }
+
+            /* page fullscreen clone：挂在 body overlay 下，不需要 fixed，只需填满 overlay */
+            :host(.page-fullscreen) {
+                width: 100%;
+                height: 100%;
+                max-height: none;
+                aspect-ratio: auto;
+                margin: 0;
             }
 
             :host {
@@ -122,6 +173,14 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         });
     }
 
+    override disconnectedCallback(): void | undefined {
+        try {
+            this.#board_viewer_select_disposable?.dispose();
+        } catch (_) {}
+        this.#board_viewer_select_disposable = null;
+        return super.disconnectedCallback();
+    }
+
     get input() {
         return this.#file_input;
     }
@@ -143,6 +202,27 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     #step_viewer_placeholder: HTMLElement;
     #viewers_container: HTMLDivElement;
     #is_full_screen = false;
+    #fullscreen_prev_body_overflow: string | null = null;
+    #fullscreen_keydown_handler: ((e: KeyboardEvent) => void) | null = null;
+    #fullscreen_overlay: HTMLDivElement | null = null;
+    // 当该实例本身就是“全屏克隆实例”时，指向原始 viewer，用于点击按钮退出全屏。
+    #fullscreen_original: ECadViewer | null = null;
+
+    // 记录当前 viewer 最近一次成功加载的 sources（用于全屏克隆快速复现内容，尤其是 ZIP/load_zip 路径）
+    #last_sources: EcadSources | null = null;
+
+    // 用于“全屏克隆实例”在首次连接 DOM 时直接从 sources 初始化，避免走默认的 load_src()
+    #initial_sources_override: EcadSources | null = null;
+    #initial_ov_3d_url_override: string | null = null;
+
+    // 当前 viewer 的 UI 视图状态快照（供外部持久化/恢复）
+    #view_state: EcadViewerViewState = {};
+    #pending_view_state: Partial<EcadViewerViewState> | null = null;
+    // 用于“全屏克隆实例”在首次连接 DOM 时直接恢复视图状态
+    #initial_view_state_override: Partial<EcadViewerViewState> | null = null;
+    #view_state_retry_scheduled = false;
+    #view_state_retry_count = 0;
+    #board_viewer_select_disposable: { dispose: () => void } | null = null;
     get project() {
         return this.#project;
     }
@@ -276,6 +356,245 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         return null;
     }
 
+    public getViewState(): EcadViewerViewState {
+        return cloneViewState(this.#view_state);
+    }
+
+    /**
+     * 外部设置/恢复 viewer 的 UI 状态。
+     * - 可在 loaded=false 时调用，内部会延迟到加载完成后再应用
+     */
+    public async setViewState(state: Partial<EcadViewerViewState>): Promise<void> {
+        if (!state || typeof state !== "object") return;
+
+        this.#merge_view_state(state);
+
+        if (!this.loaded) {
+            // 延迟到 #setup_project 之后统一 apply
+            this.#pending_view_state = {
+                ...(this.#pending_view_state || {}),
+                ...cloneViewState(state as any),
+            };
+            return;
+        }
+
+        const ok = await this.#apply_view_state(state);
+        if (!ok) {
+            this.#pending_view_state = {
+                ...(this.#pending_view_state || {}),
+                ...cloneViewState(state as any),
+            };
+            this.#schedule_view_state_retry();
+        }
+    }
+
+    #merge_view_state(fragment: Partial<EcadViewerViewState>) {
+        const next = cloneViewState(this.#view_state || {});
+        if (fragment.activeTab) next.activeTab = fragment.activeTab;
+
+        if (fragment.pcb) {
+            next.pcb = next.pcb || {};
+            if (fragment.pcb.layers) {
+                next.pcb.layers = { ...(next.pcb.layers || {}), ...fragment.pcb.layers };
+            }
+            if (fragment.pcb.objects) {
+                next.pcb.objects = { ...(next.pcb.objects || {}), ...fragment.pcb.objects };
+            }
+            if (fragment.pcb.nets) {
+                next.pcb.nets = { ...(next.pcb.nets || {}), ...fragment.pcb.nets };
+            }
+        }
+
+        this.#view_state = next;
+    }
+
+    #emit_view_state_change() {
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:view-state-change", {
+                    detail: { viewState: this.getViewState() },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        } catch (_) {}
+    }
+
+    #schedule_view_state_retry() {
+        if (this.#view_state_retry_scheduled) return;
+        if (!this.loaded) return;
+        if (!this.#pending_view_state) return;
+        // 避免无限循环
+        if (this.#view_state_retry_count > 50) return;
+        this.#view_state_retry_scheduled = true;
+        this.#view_state_retry_count += 1;
+
+        later(() => {
+            this.#view_state_retry_scheduled = false;
+            if (!this.loaded) return;
+            if (!this.#pending_view_state) return;
+
+            const vs = this.#pending_view_state;
+            // 不要在这里清空 pending：只有确认应用成功才清空
+            void (async () => {
+                const ok = await this.#apply_view_state(vs);
+                if (ok) {
+                    this.#pending_view_state = null;
+                } else {
+                    this.#schedule_view_state_retry();
+                }
+            })();
+        });
+    }
+
+    async #apply_view_state(fragment: Partial<EcadViewerViewState>): Promise<boolean> {
+        let complete = true;
+        // 这里**不能**调用 this.update()：
+        // 本项目的 render() 会创建新的子组件（例如 kc-board-app），
+        // 若在“已加载并已显示内容”后触发 update()，会导致子组件被重建，
+        // 从而错过 project.on_loaded() 已经派发过的 change 事件，最终卡在 spinner。
+
+        // Tab
+        if (fragment.activeTab && this.#tab_header) {
+            try {
+                const hdr: any = this.#tab_header as any;
+                if (typeof hdr.setActiveTab === "function") hdr.setActiveTab(fragment.activeTab);
+            } catch (_) {}
+        } else if (fragment.activeTab && !this.#tab_header) {
+            complete = false;
+        }
+
+        // PCB Layers / Objects
+        const pcb = fragment.pcb;
+        if (pcb && this.#board_app) {
+            const root = (this.#board_app as any).shadowRoot as ShadowRoot | null;
+            if (!root) complete = false;
+            if (pcb.layers) {
+                try {
+                    const panel = root?.querySelector("kc-board-layers-panel") as any;
+                    if (panel && typeof panel.setVisibilities === "function") {
+                        panel.setVisibilities(pcb.layers);
+                    } else {
+                        // 兜底：直接改 layers 可见性
+                        const viewer: any = (this.#board_app as any).viewer;
+                        const ui_layers = viewer?.layers?.in_ui_order?.();
+                        if (ui_layers) {
+                            for (const l of ui_layers) {
+                                if (Object.prototype.hasOwnProperty.call(pcb.layers, l.name)) {
+                                    l.visible = !!pcb.layers[l.name];
+                                }
+                            }
+                            viewer?.draw?.();
+                        }
+                        if (!ui_layers) complete = false;
+                    }
+                } catch (_) {}
+            }
+
+            if (pcb.objects) {
+                try {
+                    // 1) 优先直接作用到 BoardViewer（不依赖 Objects 面板是否被打开/是否已完成渲染）
+                    const viewer: any = (this.#board_app as any).viewer;
+                    if (viewer) {
+                        if (typeof pcb.objects.tracksOpacity === "number") viewer.track_opacity = pcb.objects.tracksOpacity;
+                        if (typeof pcb.objects.viasOpacity === "number") viewer.via_opacity = pcb.objects.viasOpacity;
+                        if (typeof pcb.objects.padsOpacity === "number") viewer.pad_opacity = pcb.objects.padsOpacity;
+                        if (typeof pcb.objects.zonesOpacity === "number") viewer.zone_opacity = pcb.objects.zonesOpacity;
+                        if (typeof pcb.objects.gridOpacity === "number") viewer.grid_opacity = pcb.objects.gridOpacity;
+                        if (typeof pcb.objects.pageOpacity === "number") viewer.page_opacity = pcb.objects.pageOpacity;
+                        if (typeof pcb.objects.highlightTrack === "boolean" && typeof viewer.set_highlighted_track === "function") {
+                            viewer.set_highlighted_track(pcb.objects.highlightTrack);
+                        }
+
+                        // 对象可见性：通过 LayerSet 的各类 txt_layers opacity 实现
+                        const objVis = pcb.objects.objectVisibilities;
+                        const layers: any = viewer.layers;
+                        const applyOpacity = (gen: any, opacity: number) => {
+                            try {
+                                if (!gen) return;
+                                for (const l of gen) if (l) l.opacity = opacity;
+                            } catch (_) {}
+                        };
+                        if (objVis && typeof objVis === "object" && layers) {
+                            const fpTxt = objVis["Footprint Text"];
+                            const fpRef = objVis["Reference"];
+                            const fpVal = objVis["Values"];
+                            const hidTxt = objVis["Hidden Text"];
+
+                            // 先应用 Footprint Text（会覆盖 Reference/Values 的视觉效果，语义与 UI 一致）
+                            if (typeof fpTxt === "boolean") {
+                                applyOpacity(layers.fp_txt_layers?.(), fpTxt ? 1 : 0);
+                                // 同步子项：Reference/Values
+                                applyOpacity(layers.fp_reference_txt_layers?.(), fpTxt ? 1 : 0);
+                                applyOpacity(layers.fp_value_txt_layers?.(), fpTxt ? 1 : 0);
+                            } else {
+                                if (typeof fpRef === "boolean") applyOpacity(layers.fp_reference_txt_layers?.(), fpRef ? 1 : 0);
+                                if (typeof fpVal === "boolean") applyOpacity(layers.fp_value_txt_layers?.(), fpVal ? 1 : 0);
+                            }
+
+                            if (typeof hidTxt === "boolean") applyOpacity(layers.hidden_txt_layers?.(), hidTxt ? 1 : 0);
+                        }
+
+                        if (typeof viewer.draw === "function") viewer.draw();
+                    }
+
+                    // 2) 如果 Objects 面板已存在，也同步 UI 控件值（让用户打开 Objects 时看到一致的滑块/开关）
+                    const panel = root?.querySelector("kc-board-objects-panel") as any;
+                    if (panel && typeof panel.setSettings === "function") {
+                        panel.setSettings(pcb.objects);
+                    }
+                } catch (_) {}
+            }
+
+            // Nets panel settings
+            if (pcb.nets) {
+                try {
+                    // 兜底：即使 Nets 面板尚未 ready，也先尝试直接让 BoardViewer 聚焦该 net
+                    if (pcb.nets.selectedNetNumber === null) {
+                        const viewer: any = (this.#board_app as any).viewer;
+                        if (typeof viewer?.clear_net_focus === "function") {
+                            try {
+                                viewer.clear_net_focus();
+                            } catch (_) {}
+                        } else if (viewer?.loaded?.isOpen) {
+                            // 兜底：若没有 clear_net_focus，则至少尝试 highlight_net(null)
+                            try {
+                                viewer.focus_net(null);
+                            } catch (_) {}
+                        } else {
+                            complete = false;
+                        }
+                    } else if (
+                        typeof pcb.nets.selectedNetNumber === "number" &&
+                        !Number.isNaN(pcb.nets.selectedNetNumber)
+                    ) {
+                        const viewer: any = (this.#board_app as any).viewer;
+                        if (viewer?.loaded?.isOpen) {
+                            try {
+                                viewer.focus_net(pcb.nets.selectedNetNumber);
+                            } catch (_) {}
+                        } else {
+                            complete = false;
+                        }
+                    }
+
+                    const panel = root?.querySelector("kc-board-nets-panel") as any;
+                    if (panel && typeof panel.setSettings === "function") {
+                        panel.setSettings(pcb.nets);
+                    } else {
+                        complete = false;
+                    }
+                } catch (_) {}
+            }
+        } else if (pcb && !this.#board_app) {
+            // 还未渲染出 board app，延迟重试
+            complete = false;
+        }
+
+        this.#emit_view_state_change();
+        return complete;
+    }
+
     attributeChangedCallback(
         name: string,
         old_value: string,
@@ -292,11 +611,80 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     override initialContentCallback() {
         this.#setup_events();
         later(() => {
+            // 若外部（例如全屏克隆）提前注入了 viewState，则先记录，待加载完成后统一 apply
+            if (this.#initial_view_state_override) {
+                const vs = this.#initial_view_state_override;
+                this.#initial_view_state_override = null;
+                void this.setViewState(vs);
+            }
+
+            // 若外部（例如全屏克隆）提前注入了 sources，则优先按该 sources 初始化，避免走默认 load_src()
+            if (this.#initial_sources_override) {
+                const sources = this.#initial_sources_override;
+                this.#initial_sources_override = null;
+
+                if (this.#initial_ov_3d_url_override) {
+                    this.#project.ov_3d_url = this.#initial_ov_3d_url_override;
+                    this.#initial_ov_3d_url_override = null;
+                }
+
+                void this.#setup_project(sources);
+                return;
+            }
+
             this.load_src();
         });
     }
 
-    async #setup_events() {}
+    async #setup_events() {
+        // PCB Layers 面板：层可见性变化
+        this.addEventListener(
+            "ecad-viewer:board-layer-visibility-change",
+            (e: Event) => {
+                const detail: any = (e as any).detail || {};
+                const layers = detail.layerVisibility;
+                if (!layers || typeof layers !== "object") return;
+                this.#merge_view_state({ pcb: { layers } });
+                this.#emit_view_state_change();
+            },
+        );
+
+        // PCB Objects 面板：透明度/开关等变化
+        this.addEventListener(
+            "ecad-viewer:board-objects-settings-change",
+            (e: Event) => {
+                const detail: any = (e as any).detail || {};
+                if (!detail || typeof detail !== "object") return;
+                this.#merge_view_state({ pcb: { objects: detail } });
+                this.#emit_view_state_change();
+            },
+        );
+
+        // PCB Objects 面板：对象可见性变化（Reference/Values/...）
+        this.addEventListener(
+            "ecad-viewer:board-object-visibility-change",
+            (e: Event) => {
+                const detail: any = (e as any).detail || {};
+                const obj = detail.objectVisibilities;
+                if (!obj || typeof obj !== "object") return;
+                this.#merge_view_state({
+                    pcb: { objects: { objectVisibilities: obj } },
+                });
+                this.#emit_view_state_change();
+            },
+        );
+
+        // PCB Nets 面板：搜索过滤等设置变化
+        this.addEventListener(
+            "ecad-viewer:board-nets-settings-change",
+            (e: Event) => {
+                const detail: any = (e as any).detail || {};
+                if (!detail || typeof detail !== "object") return;
+                this.#merge_view_state({ pcb: { nets: detail } });
+                this.#emit_view_state_change();
+            },
+        );
+    }
 
     async load_zip(file: Blob) {
         const files = await ZipUtils.unzipFile(file);
@@ -418,10 +806,108 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         this.loading = true;
 
         try {
+            // 保存一份 sources 的浅拷贝，避免外部数组/对象被后续修改
+            this.#last_sources = {
+                urls: [...(sources.urls ?? [])],
+                blobs: [...(sources.blobs ?? [])].map((b) => ({
+                    filename: b.filename,
+                    content: b.content,
+                })),
+            };
+
             await this.#project.load(sources);
 
             this.loaded = true;
             await this.update();
+
+            // 监听 PCB Viewer 的“选中”事件，用于持久化双击线路等触发的 net 选择
+            try {
+                this.#board_viewer_select_disposable?.dispose();
+            } catch (_) {}
+            this.#board_viewer_select_disposable = null;
+            try {
+                const boardViewer: any = this.#board_app?.viewer;
+                if (boardViewer && typeof boardViewer.addEventListener === "function") {
+                    this.#board_viewer_select_disposable =
+                        boardViewer.addEventListener(
+                            KiCanvasSelectEvent.type,
+                            (e: any) => {
+                                try {
+                                    const item = e?.detail?.item;
+                                    if (!item) return;
+
+                                    // net 可能是 number（kicad item），也可能是 string（highlight_net 里派发的 {net: name,...}）
+                                    let netNum: number | null = null;
+                                    const rawNet = (item as any).net;
+                                    if (typeof rawNet === "number" && !Number.isNaN(rawNet) && rawNet > 0) {
+                                        netNum = rawNet;
+                                    } else if (typeof rawNet === "string" && rawNet) {
+                                        const pcb = boardViewer?.board;
+                                        if (pcb instanceof KicadPCB) {
+                                            const found = pcb.nets?.find((n: any) => n?.name === rawNet);
+                                            const nnum = found?.number;
+                                            if (typeof nnum === "number" && !Number.isNaN(nnum) && nnum > 0) {
+                                                netNum = nnum;
+                                            }
+                                        }
+                                    }
+
+                                    if (!netNum) return;
+
+                                    this.#merge_view_state({
+                                        pcb: { nets: { selectedNetNumber: netNum } },
+                                    });
+                                    this.#emit_view_state_change();
+
+                                    // 若 Nets 面板已渲染，顺便同步 UI 高亮（通过面板自身选中流程驱动）
+                                    try {
+                                        const root = (this.#board_app as any).shadowRoot as ShadowRoot | null;
+                                        const panel = root?.querySelector("kc-board-nets-panel") as any;
+                                        if (panel && typeof panel.setSettings === "function") {
+                                            panel.setSettings({ selectedNetNumber: netNum });
+                                        }
+                                    } catch (_) {}
+                                } catch (_) {}
+                            },
+                        ) as any;
+
+                    // 监听 net focus 被取消（例如点击空白区域触发恢复可见性）
+                    boardViewer.addEventListener(
+                        "kicanvas:net-focus-change",
+                        (e: any) => {
+                            try {
+                                const netNumber = e?.detail?.netNumber ?? null;
+                                if (netNumber !== null) return;
+                                this.#merge_view_state({
+                                    pcb: { nets: { selectedNetNumber: null } },
+                                });
+                                this.#emit_view_state_change();
+
+                                // 同步清空 Nets 面板高亮
+                                try {
+                                    const root = (this.#board_app as any).shadowRoot as ShadowRoot | null;
+                                    const panel = root?.querySelector("kc-board-nets-panel") as any;
+                                    if (panel && typeof panel.setSettings === "function") {
+                                        panel.setSettings({ selectedNetNumber: null });
+                                    }
+                                } catch (_) {}
+                            } catch (_) {}
+                        },
+                    );
+                }
+            } catch (_) {}
+
+            // 若外部提前设置了 viewState（例如 Editor.js block 恢复/全屏克隆），在首次渲染后应用
+            if (this.#pending_view_state) {
+                const vs = this.#pending_view_state;
+                const ok = await this.#apply_view_state(vs);
+                if (ok) {
+                    this.#pending_view_state = null;
+                } else {
+                    this.#schedule_view_state_retry();
+                }
+            }
+
             this.#project.on_loaded();
         } finally {
             this.loading = false;
@@ -446,20 +932,148 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     get has_bom() {
         return this.has_pcb || this.has_sch;
     }
+
+    #exit_page_fullscreen() {
+        if (!this.#is_full_screen) return;
+
+        const doc = window.document;
+
+        // 移除 ESC 监听
+        if (this.#fullscreen_keydown_handler) {
+            doc.removeEventListener(
+                "keydown",
+                this.#fullscreen_keydown_handler,
+                true,
+            );
+            this.#fullscreen_keydown_handler = null;
+        }
+
+        // 恢复 body 滚动
+        if (this.#fullscreen_prev_body_overflow !== null) {
+            doc.body.style.overflow = this.#fullscreen_prev_body_overflow;
+            this.#fullscreen_prev_body_overflow = null;
+        }
+
+        // 移除 overlay（会连带销毁克隆 viewer，触发其 disconnectedCallback dispose 资源）
+        if (this.#fullscreen_overlay?.parentNode) {
+            this.#fullscreen_overlay.parentNode.removeChild(
+                this.#fullscreen_overlay,
+            );
+        }
+        this.#fullscreen_overlay = null;
+
+        // 还原原始 viewer 的可见性与交互
+        this.style.visibility = "";
+        this.style.pointerEvents = "";
+
+        this.#is_full_screen = false;
+
+        later(() => {
+            window.dispatchEvent(new Event("resize"));
+        });
+
+        if (this.#ov_d_app) this.#ov_d_app.on_show();
+    }
+
+    #enter_page_fullscreen() {
+        const doc = window.document;
+        const body = doc.body;
+
+        // 覆盖层放在 body 下，确保覆盖 QNotes 顶栏（避免被 editor 容器的 stacking context 限制）
+        const overlay = doc.createElement("div");
+        overlay.className = "ecad-viewer__page-fullscreen-overlay";
+        overlay.style.position = "fixed";
+        overlay.style.inset = "0";
+        overlay.style.zIndex = "2147483647";
+        overlay.style.background = "white";
+        overlay.style.margin = "0";
+        overlay.style.padding = "0";
+        overlay.style.display = "flex";
+        overlay.style.alignItems = "stretch";
+        overlay.style.justifyContent = "stretch";
+
+        // 禁止页面滚动，避免底层 Editor.js/QNotes 跟随滚动
+        this.#fullscreen_prev_body_overflow = body.style.overflow;
+        body.style.overflow = "hidden";
+
+        body.appendChild(overlay);
+
+        // 创建一个新的 viewer（类似 Excalidraw/Univer 的 portal 思路），避免移动当前 DOM 导致交互 dispose
+        const clone = doc.createElement("ecad-viewer") as ECadViewer;
+        clone.#fullscreen_original = this;
+        clone.classList.add("page-fullscreen");
+        clone.style.width = "100%";
+        clone.style.height = "100%";
+        clone.style.flex = "1";
+
+        // 复制必要的 attribute（例如 comment-mode）
+        if (this.hasAttribute("comment-mode")) {
+            const v = this.getAttribute("comment-mode");
+            // 属性存在但为空时也视为开启
+            clone.setAttribute("comment-mode", v ?? "true");
+        }
+
+        // ZIP / window.zip_url 等路径会走 load_zip()，不会把 sources 写回 DOM。
+        // 因此优先用“最近一次加载的 sources”来初始化克隆实例，确保全屏内容一致。
+        if (this.#last_sources) {
+            clone.#initial_sources_override = this.#last_sources;
+            clone.#initial_ov_3d_url_override = this.#project.ov_3d_url ?? null;
+        } else {
+            // 兜底：从 DOM 中 clone 数据源（适用于 ecad-blob/ecad-source 方式加载）
+            // 注意：不能直接“移动”这些子元素，否则它们作为 CustomElement 也会在重连时触发 attachShadow 冲突。
+            for (const src of this.querySelectorAll(
+                "ecad-source, ecad-blob, ecad-3d-source",
+            )) {
+                clone.appendChild(src.cloneNode(true));
+            }
+        }
+
+        // 复制当前视图设置（层可见性/透明度等），保证全屏与嵌入态一致
+        try {
+            clone.#initial_view_state_override = this.getViewState();
+        } catch (_) {}
+
+        overlay.appendChild(clone);
+
+        // 原始 viewer 保留在原位（避免布局抖动），但隐藏并禁用交互
+        this.style.visibility = "hidden";
+        this.style.pointerEvents = "none";
+
+        // ESC 退出全屏（绑定在 document，保证无论焦点在哪都能退出）
+        this.#fullscreen_keydown_handler = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                this.#exit_page_fullscreen();
+            }
+        };
+        doc.addEventListener("keydown", this.#fullscreen_keydown_handler, true);
+
+        this.#fullscreen_overlay = overlay;
+        this.#is_full_screen = true;
+
+        later(() => {
+            window.dispatchEvent(new Event("resize"));
+        });
+    }
+
     on_full_windows() {
         if (window.is_module_lib) {
             console.log("is_module_lib " + window.is_module_lib);
             return show_ecad_viewer();
         }
 
-        if (!this.#is_full_screen) {
-            window.document.documentElement.requestFullscreen();
-            this.#is_full_screen = true;
-        } else {
-            window.document.exitFullscreen();
-            this.#is_full_screen = false;
+        // 如果当前实例是“全屏克隆实例”，则点击按钮应退出全屏（由原始实例负责清理 overlay）
+        if (this.#fullscreen_original) {
+            this.#fullscreen_original.#exit_page_fullscreen();
+            return;
         }
-        if (this.#ov_d_app) this.#ov_d_app.on_show();
+
+        if (this.#is_full_screen) {
+            this.#exit_page_fullscreen();
+        } else {
+            this.#enter_page_fullscreen();
+        }
     }
 
     override render() {
@@ -489,6 +1103,8 @@ export class ECadViewer extends KCUIElement implements InputContainer {
             const tab = (event as TabActivateEvent).detail;
             this.#active_tab = tab.current;
             this.dispatchEvent(new TabActivateEvent(tab));
+            this.#merge_view_state({ activeTab: tab.current });
+            this.#emit_view_state_change();
             if (tab.previous) {
                 switch (tab.previous) {
                     case TabKind.pcb:

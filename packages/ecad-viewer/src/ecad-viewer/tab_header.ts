@@ -379,6 +379,13 @@ export class TabHeaderElement extends KCUIElement {
         }
     }
 
+    /**
+     * 外部可调用的 tab 切换（用于恢复上次打开的页签）。
+     */
+    public setActiveTab(kind: TabKind) {
+        this.activateTab(kind);
+    }
+
     private activateTab(kind: TabKind) {
         if (this.#current_tab === kind) return;
 
