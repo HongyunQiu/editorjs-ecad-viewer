@@ -476,10 +476,7 @@ export class BoardViewer extends DocumentViewer<
                     const glyph_size = text_size * 0.55;
                     const stroke_w = text_size / 12.0;
 
-                    const color =
-                        (cu_layer.color as Color) ??
-                        label_layer.color ??
-                        Color.white;
+                    const color = Color.white;
 
                     for (let ii = 1; ii < divisions; ii++) {
                         const t = ii / divisions;
@@ -571,7 +568,7 @@ export class BoardViewer extends DocumentViewer<
                         tsize *= 0.75;
 
                         const stroke_w = tsize / 10.0;
-                        const color = via_layer.color ?? Color.white;
+                        const color = Color.black;
 
                         draw_text(display_netname, pos, tsize, stroke_w, 0, color);
                     }

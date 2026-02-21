@@ -516,7 +516,7 @@ export class LayerSet extends BaseLayerSet {
 
     is_fp_reference_txt_layers_visible() {
         for (const layer of this.fp_reference_txt_layers()) {
-            if (layer.opacity !== 0) return true;
+            if (layer.opacity !== 0 && layer.visible) return true;
         }
         return false;
     }
@@ -534,7 +534,7 @@ export class LayerSet extends BaseLayerSet {
 
     is_fp_value_txt_layers_visible() {
         for (const layer of this.fp_value_txt_layers()) {
-            if (layer.opacity !== 0) return true;
+            if (layer.opacity !== 0 && layer.visible) return true;
         }
         return false;
     }
@@ -554,7 +554,7 @@ export class LayerSet extends BaseLayerSet {
 
     is_fp_txt_layers_visible() {
         for (const layer of this.fp_txt_layers()) {
-            if (layer.opacity !== 0) return true;
+            if (layer.opacity !== 0 && layer.visible) return true;
         }
         return false;
     }
@@ -575,7 +575,7 @@ export class LayerSet extends BaseLayerSet {
 
     is_hidden_txt_layers_visible() {
         for (const layer of this.hidden_txt_layers()) {
-            if (layer.opacity !== 0) return true;
+            if (layer.opacity !== 0 && layer.visible) return true;
         }
         return false;
     }

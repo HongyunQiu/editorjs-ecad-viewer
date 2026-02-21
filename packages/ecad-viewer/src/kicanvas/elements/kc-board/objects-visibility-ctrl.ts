@@ -41,6 +41,10 @@ export class ObjVisibilityCtrlList extends KCUIElement {
     viewer: BoardViewer;
     #pending_object_visibilities: Record<string, boolean> | null = null;
     #did_initial_sync_from_viewer = false;
+    #listening_view_state_change = false;
+    #on_view_state_change = () => {
+        this.#sync_ctrls_from_viewer_layers(true);
+    };
 
     public constructor() {
         super();
@@ -52,13 +56,36 @@ export class ObjVisibilityCtrlList extends KCUIElement {
             this.viewer = await this.requestLazyContext("viewer");
             await this.viewer.loaded;
             super.connectedCallback();
+            this.#setup_view_state_sync();
             this.#apply_pending_object_visibilities();
         })();
+    }
+
+    override disconnectedCallback(): void {
+        try {
+            window.removeEventListener(
+                "ecad-viewer:view-state-change",
+                this.#on_view_state_change as any,
+            );
+        } catch (_) {}
+        this.#listening_view_state_change = false;
+        super.disconnectedCallback();
     }
 
     override renderedCallback(): void | undefined {
         this.#apply_pending_object_visibilities();
         this.#sync_ctrls_from_viewer_layers();
+    }
+
+    private #setup_view_state_sync() {
+        if (this.#listening_view_state_change) return;
+        this.#listening_view_state_change = true;
+        try {
+            window.addEventListener(
+                "ecad-viewer:view-state-change",
+                this.#on_view_state_change as any,
+            );
+        } catch (_) {}
     }
 
     /**
@@ -220,8 +247,8 @@ export class ObjVisibilityCtrlList extends KCUIElement {
      *
      * 注意：此同步**只更新控件外观**，不触发 apply_one / emit change，避免把“恢复状态”误判为用户修改。
      */
-    private #sync_ctrls_from_viewer_layers() {
-        if (this.#did_initial_sync_from_viewer) return;
+    private #sync_ctrls_from_viewer_layers(force = false) {
+        if (this.#did_initial_sync_from_viewer && !force) return;
         if (!this.viewer) return;
 
         const root = this.shadowRoot || this.renderRoot;
@@ -231,28 +258,29 @@ export class ObjVisibilityCtrlList extends KCUIElement {
         const layers = this.viewer.layers as any as LayerSet;
         if (!layers) return;
 
-        const layerOpacity = (name: string): number | null => {
+        const layerIsActuallyVisible = (name: string): boolean | null => {
             try {
                 const l = (layers as any).by_name?.(name);
                 if (!l) return null;
                 const op = (l as any).opacity;
-                return typeof op === "number" ? op : null;
+                const vis = (l as any).visible;
+                if (typeof op !== "number") return null;
+                if (typeof vis !== "boolean") return null;
+                return op !== 0 && vis;
             } catch (_) {
                 return null;
             }
         };
 
-        const anyNonZero = (names: string[]) =>
-            names.some((n) => {
-                const op = layerOpacity(n);
-                return typeof op === "number" && op !== 0;
-            });
+        const anyActuallyVisible = (names: string[]) =>
+            names.some((n) => layerIsActuallyVisible(n) === true);
 
         const anyTrackNetLabelNonZero = () => {
             try {
                 for (const it of (layers as any).track_netname_label_layers?.() ?? []) {
                     const op = (it as any)?.opacity;
-                    if (typeof op === "number" && op !== 0) return true;
+                    const vis = (it as any)?.visible;
+                    if (typeof op === "number" && op !== 0 && vis === true) return true;
                 }
             } catch (_) {}
             return false;
@@ -278,20 +306,21 @@ export class ObjVisibilityCtrlList extends KCUIElement {
                             ? !!(layers as any).is_hidden_txt_layers_visible()
                             : null;
                     case ObjVisibilities.Pad_Numbers:
-                        return anyNonZero([
+                        return anyActuallyVisible([
                             LabelLayerNames.pad_numbers,
                             LabelLayerNames.pad_numbers_front,
                             LabelLayerNames.pad_numbers_back,
                         ]);
                     case ObjVisibilities.NetNames_Pads:
-                        return anyNonZero([
+                        return anyActuallyVisible([
                             LabelLayerNames.pad_net_names,
                             LabelLayerNames.pad_net_names_front,
                             LabelLayerNames.pad_net_names_back,
                         ]);
                     case ObjVisibilities.NetNames_Tracks: {
-                        const via = layerOpacity(LabelLayerNames.via_net_names);
-                        const viaOn = typeof via === "number" && via !== 0;
+                        const viaOn =
+                            layerIsActuallyVisible(LabelLayerNames.via_net_names) ===
+                            true;
                         return viaOn || anyTrackNetLabelNonZero();
                     }
                 }
