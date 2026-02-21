@@ -6,7 +6,7 @@
 
 import { attribute, css, html } from "../../../base/web-components";
 import { KCUIElement } from "../../../kc-ui";
-import { LayerSet } from "../../../viewers/board/layers";
+import { LabelLayerNames, LayerSet } from "../../../viewers/board/layers";
 import { BoardViewer } from "../../../viewers/board/viewer";
 
 enum ObjVisibilities {
@@ -14,6 +14,9 @@ enum ObjVisibilities {
     FP_Reference = "Reference",
     FP_Txt = "Footprint Text",
     Hidden_Txt = "Hidden Text",
+    Pad_Numbers = "Pad Numbers",
+    NetNames_Pads = "Net Names (Pads)",
+    NetNames_Tracks = "Net Names (Tracks/Vias)",
 }
 
 const BOARD_OBJECT_VIS_CHANGE_EVENT =
@@ -37,6 +40,7 @@ export class ObjVisibilityCtrlList extends KCUIElement {
 
     viewer: BoardViewer;
     #pending_object_visibilities: Record<string, boolean> | null = null;
+    #did_initial_sync_from_viewer = false;
 
     public constructor() {
         super();
@@ -54,6 +58,7 @@ export class ObjVisibilityCtrlList extends KCUIElement {
 
     override renderedCallback(): void | undefined {
         this.#apply_pending_object_visibilities();
+        this.#sync_ctrls_from_viewer_layers();
     }
 
     /**
@@ -124,6 +129,50 @@ export class ObjVisibilityCtrlList extends KCUIElement {
                     if (it) it.opacity = p ? 1 : 0;
                 }
                 break;
+            case ObjVisibilities.Pad_Numbers:
+                {
+                    // Through-hole pad labels (global)
+                    const l = layers.by_name(LabelLayerNames.pad_numbers);
+                    if (l) l.opacity = p ? 1 : 0;
+
+                    // SMD pad labels (front/back)
+                    for (const name of [
+                        LabelLayerNames.pad_numbers_front,
+                        LabelLayerNames.pad_numbers_back,
+                    ]) {
+                        const ll = layers.by_name(name);
+                        if (ll) ll.opacity = p ? 1 : 0;
+                    }
+                }
+                break;
+            case ObjVisibilities.NetNames_Pads:
+                {
+                    // Through-hole pad netnames (global)
+                    const l = layers.by_name(LabelLayerNames.pad_net_names);
+                    if (l) l.opacity = p ? 1 : 0;
+
+                    // SMD pad netnames (front/back)
+                    for (const name of [
+                        LabelLayerNames.pad_net_names_front,
+                        LabelLayerNames.pad_net_names_back,
+                    ]) {
+                        const ll = layers.by_name(name);
+                        if (ll) ll.opacity = p ? 1 : 0;
+                    }
+                }
+                break;
+            case ObjVisibilities.NetNames_Tracks:
+                {
+                    // Track netnames are per-copper-layer (KiCad-like). Toggle all at once.
+                    for (const it of layers.track_netname_label_layers?.() ?? []) {
+                        if (it) it.opacity = p ? 1 : 0;
+                    }
+
+                    // Via netnames are on a separate layer (KiCad-like).
+                    const viaLayer = layers.by_name(LabelLayerNames.via_net_names);
+                    if (viaLayer) viaLayer.opacity = p ? 1 : 0;
+                }
+                break;
         }
 
         this.viewer.draw();
@@ -162,6 +211,105 @@ export class ObjVisibilityCtrlList extends KCUIElement {
         this.#emit_object_visibility_change();
     }
 
+    /**
+     * 初次渲染时，若外部没有显式调用 setObjectVisibilities()，控件会按默认值显示，
+     * 但 viewer 可能已被 viewState 恢复为“非默认”的 layer opacity。
+     *
+     * 为避免 UI 与实际显示不一致（造成 Footprint Text / Pad Numbers / Net Names 等开关“混乱”观感），
+     * 这里在控件已渲染且 viewer 已 ready 后，从当前 layers 的 opacity 反推一次 UI 状态。
+     *
+     * 注意：此同步**只更新控件外观**，不触发 apply_one / emit change，避免把“恢复状态”误判为用户修改。
+     */
+    private #sync_ctrls_from_viewer_layers() {
+        if (this.#did_initial_sync_from_viewer) return;
+        if (!this.viewer) return;
+
+        const root = this.shadowRoot || this.renderRoot;
+        const ctrls = root?.querySelectorAll("ecad-visibility-ctrl");
+        if (!ctrls || ctrls.length === 0) return;
+
+        const layers = this.viewer.layers as any as LayerSet;
+        if (!layers) return;
+
+        const layerOpacity = (name: string): number | null => {
+            try {
+                const l = (layers as any).by_name?.(name);
+                if (!l) return null;
+                const op = (l as any).opacity;
+                return typeof op === "number" ? op : null;
+            } catch (_) {
+                return null;
+            }
+        };
+
+        const anyNonZero = (names: string[]) =>
+            names.some((n) => {
+                const op = layerOpacity(n);
+                return typeof op === "number" && op !== 0;
+            });
+
+        const anyTrackNetLabelNonZero = () => {
+            try {
+                for (const it of (layers as any).track_netname_label_layers?.() ?? []) {
+                    const op = (it as any)?.opacity;
+                    if (typeof op === "number" && op !== 0) return true;
+                }
+            } catch (_) {}
+            return false;
+        };
+
+        const inferVisible = (obj_name: string): boolean | null => {
+            try {
+                switch (obj_name) {
+                    case ObjVisibilities.FP_Reference:
+                        return typeof (layers as any).is_fp_reference_txt_layers_visible === "function"
+                            ? !!(layers as any).is_fp_reference_txt_layers_visible()
+                            : null;
+                    case ObjVisibilities.FP_Values:
+                        return typeof (layers as any).is_fp_value_txt_layers_visible === "function"
+                            ? !!(layers as any).is_fp_value_txt_layers_visible()
+                            : null;
+                    case ObjVisibilities.FP_Txt:
+                        return typeof (layers as any).is_fp_txt_layers_visible === "function"
+                            ? !!(layers as any).is_fp_txt_layers_visible()
+                            : null;
+                    case ObjVisibilities.Hidden_Txt:
+                        return typeof (layers as any).is_hidden_txt_layers_visible === "function"
+                            ? !!(layers as any).is_hidden_txt_layers_visible()
+                            : null;
+                    case ObjVisibilities.Pad_Numbers:
+                        return anyNonZero([
+                            LabelLayerNames.pad_numbers,
+                            LabelLayerNames.pad_numbers_front,
+                            LabelLayerNames.pad_numbers_back,
+                        ]);
+                    case ObjVisibilities.NetNames_Pads:
+                        return anyNonZero([
+                            LabelLayerNames.pad_net_names,
+                            LabelLayerNames.pad_net_names_front,
+                            LabelLayerNames.pad_net_names_back,
+                        ]);
+                    case ObjVisibilities.NetNames_Tracks: {
+                        const via = layerOpacity(LabelLayerNames.via_net_names);
+                        const viaOn = typeof via === "number" && via !== 0;
+                        return viaOn || anyTrackNetLabelNonZero();
+                    }
+                }
+            } catch (_) {}
+            return null;
+        };
+
+        try {
+            for (const el of Array.from(ctrls) as any[]) {
+                const name = String(el.obj_name ?? "");
+                if (!name) continue;
+                const v = inferVisible(name);
+                if (typeof v === "boolean") el.obj_visible = v;
+            }
+            this.#did_initial_sync_from_viewer = true;
+        } catch (_) {}
+    }
+
     override initialContentCallback() {
         // Toggle layer visibility when its item's visibility control is clicked
         this.renderRoot.addEventListener(
@@ -179,14 +327,24 @@ export class ObjVisibilityCtrlList extends KCUIElement {
     override render() {
         const items: ReturnType<typeof html>[] = [];
 
+        const default_on = new Set<string>([
+            ObjVisibilities.FP_Reference,
+            ObjVisibilities.FP_Values,
+            ObjVisibilities.FP_Txt,
+        ]);
+
         for (const obj of [
             ObjVisibilities.FP_Reference,
             ObjVisibilities.FP_Values,
 
             ObjVisibilities.FP_Txt,
             ObjVisibilities.Hidden_Txt,
+
+            ObjVisibilities.Pad_Numbers,
+            ObjVisibilities.NetNames_Pads,
+            ObjVisibilities.NetNames_Tracks,
         ]) {
-            const visible = obj !== ObjVisibilities.Hidden_Txt ? "" : undefined;
+            const visible = default_on.has(obj) ? "" : undefined;
             items.push(
                 html`<ecad-visibility-ctrl
                     obj-name="${obj}"

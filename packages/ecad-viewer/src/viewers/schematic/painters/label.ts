@@ -35,7 +35,7 @@ export abstract class LabelPainter extends SchematicItemPainter {
             return;
         }
 
-        const schtext = new SchText(l.shown_text);
+        const schtext = new SchText(this.transform_text(l, l.shown_text));
         schtext.apply_at(l.at);
         schtext.apply_effects(l.effects);
 
@@ -68,6 +68,13 @@ export abstract class LabelPainter extends SchematicItemPainter {
         }
 
         this.gfx.state.pop();
+    }
+
+    protected transform_text(
+        _l: schematic_items.Label,
+        shown_text: string,
+    ): string {
+        return shown_text;
     }
 
     create_shape(l: schematic_items.Label, schtext: SchText): Vec2[] {
@@ -129,6 +136,14 @@ export class NetLabelPainter extends LabelPainter {
 
     override get color() {
         return this.theme.label_local;
+    }
+
+    protected override transform_text(
+        _l: schematic_items.Label,
+        shown_text: string,
+    ): string {
+        if (!shown_text) return shown_text;
+        return shown_text.toLowerCase().startsWith("unconnected") ? "x" : shown_text;
     }
     override get_schematic_text_offset(
         l: schematic_items.Label,

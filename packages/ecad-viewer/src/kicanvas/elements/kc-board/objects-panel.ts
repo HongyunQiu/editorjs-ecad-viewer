@@ -19,6 +19,7 @@ const BOARD_OBJECTS_SETTINGS_CHANGE_EVENT =
 export class KCBoardObjectsPanelElement extends KCUIElement {
     viewer: BoardViewer;
     #check_highlight_track: HTMLInputElement;
+    #did_initial_sync_from_viewer = false;
     #pending_settings: {
         tracksOpacity?: number;
         viasOpacity?: number;
@@ -200,6 +201,45 @@ export class KCBoardObjectsPanelElement extends KCUIElement {
 
     override renderedCallback(): void | undefined {
         this.#apply_pending_settings();
+        this.#sync_ui_from_viewer();
+    }
+
+    private #sync_ui_from_viewer() {
+        if (this.#did_initial_sync_from_viewer) return;
+        // 如果外部调用了 setSettings()，以外部提供的 pending 为准
+        if (this.#pending_settings) return;
+        if (!this.viewer) return;
+
+        const root = this.shadowRoot || this.renderRoot;
+        if (!root) return;
+
+        const setRange = (name: string, value?: number) => {
+            if (typeof value !== "number" || Number.isNaN(value)) return;
+            const el = root?.querySelector(`kc-ui-range[name="${name}"]`) as
+                | KCUIRangeElement
+                | null;
+            if (!el) return;
+            el.setAttribute("value", String(value));
+            el.value = String(value);
+        };
+
+        try {
+            // 从当前 viewer 反推 UI（不触发 #emit_settings_change）
+            setRange("tracks", (this.viewer as any).track_opacity);
+            setRange("vias", (this.viewer as any).via_opacity);
+            setRange("pads", (this.viewer as any).pad_opacity);
+            setRange("zones", (this.viewer as any).zone_opacity);
+            setRange("grid", (this.viewer as any).grid_opacity);
+            setRange("page", (this.viewer as any).page_opacity);
+
+            // 同步高亮开关（需要 viewer 提供 getter；若不存在则保持默认）
+            const v: any = this.viewer as any;
+            if (typeof v.get_highlighted_track === "function" && this.#check_highlight_track) {
+                this.#check_highlight_track.checked = !!v.get_highlighted_track();
+            }
+
+            this.#did_initial_sync_from_viewer = true;
+        } catch (_) {}
     }
 
     override render() {

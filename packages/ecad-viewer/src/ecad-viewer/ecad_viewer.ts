@@ -28,6 +28,7 @@ import {
     TabMenuVisibleChangeEvent,
 } from "../viewers/base/events";
 import { KicadPCB } from "../kicad";
+import { LabelLayerNames } from "../viewers/board/layers";
 
 export {
     CommentClickEvent,
@@ -171,6 +172,22 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         this.addEventListener("contextmenu", function (event) {
             event.preventDefault();
         });
+
+        // 在 ecad 内部直接显示加载状态（显示在 spinner 下方）。
+        // 监听所有冒泡到此处的 loading-status（含 project 解析、PCB 绘制等）。
+        try {
+            this.addEventListener(
+                "ecad-viewer:loading-status" as any,
+                (e: any) => {
+                    try {
+                        const msg = e?.detail?.message || "";
+                        if (!msg) return;
+                        this.#set_global_spinner_text(String(msg));
+                    } catch (_) {}
+                },
+                { capture: true } as any,
+            );
+        } catch (_) {}
     }
 
     override disconnectedCallback(): void | undefined {
@@ -210,6 +227,23 @@ export class ECadViewer extends KCUIElement implements InputContainer {
 
     // 记录当前 viewer 最近一次成功加载的 sources（用于全屏克隆快速复现内容，尤其是 ZIP/load_zip 路径）
     #last_sources: EcadSources | null = null;
+
+    #loading_status_text = "";
+
+    #set_global_spinner_text(text: string) {
+        const t = String(text || "");
+        this.#loading_status_text = t;
+        try {
+            (this.#spinner as any).text = t;
+        } catch (_) {
+            try {
+                if (this.#spinner) {
+                    if (t) this.#spinner.setAttribute("text", t);
+                    else this.#spinner.removeAttribute("text");
+                }
+            } catch (_) {}
+        }
+    }
 
     // 用于“全屏克隆实例”在首次连接 DOM 时直接从 sources 初始化，避免走默认的 load_src()
     #initial_sources_override: EcadSources | null = null;
@@ -520,6 +554,9 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                             const fpRef = objVis["Reference"];
                             const fpVal = objVis["Values"];
                             const hidTxt = objVis["Hidden Text"];
+                            const padNums = objVis["Pad Numbers"];
+                            const netPads = objVis["Net Names (Pads)"];
+                            const netTracks = objVis["Net Names (Tracks/Vias)"];
 
                             // 先应用 Footprint Text（会覆盖 Reference/Values 的视觉效果，语义与 UI 一致）
                             if (typeof fpTxt === "boolean") {
@@ -533,6 +570,37 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                             }
 
                             if (typeof hidTxt === "boolean") applyOpacity(layers.hidden_txt_layers?.(), hidTxt ? 1 : 0);
+
+                            // Label layers (pads/tracks netnames, pad numbers)
+                            try {
+                                const setLayerOpacity = (name: string, on: boolean) => {
+                                    const l = layers?.by_name?.(name);
+                                    if (l) l.opacity = on ? 1 : 0;
+                                };
+
+                                if (typeof padNums === "boolean")
+                                {
+                                    setLayerOpacity(LabelLayerNames.pad_numbers, padNums);
+                                    setLayerOpacity(LabelLayerNames.pad_numbers_front, padNums);
+                                    setLayerOpacity(LabelLayerNames.pad_numbers_back, padNums);
+                                }
+                                if (typeof netPads === "boolean")
+                                {
+                                    setLayerOpacity(LabelLayerNames.pad_net_names, netPads);
+                                    setLayerOpacity(LabelLayerNames.pad_net_names_front, netPads);
+                                    setLayerOpacity(LabelLayerNames.pad_net_names_back, netPads);
+                                }
+                                if (typeof netTracks === "boolean") {
+                                    // Track netnames: per-copper-layer label layers (KiCad-like)
+                                    try {
+                                        for (const it of layers.track_netname_label_layers?.() ?? [])
+                                            if (it) it.opacity = netTracks ? 1 : 0;
+                                    } catch (_) {}
+
+                                    // Via netnames: separate layer (KiCad-like)
+                                    setLayerOpacity(LabelLayerNames.via_net_names, netTracks);
+                                }
+                            } catch (_) {}
                         }
 
                         if (typeof viewer.draw === "function") viewer.draw();
@@ -687,7 +755,24 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     }
 
     async load_zip(file: Blob) {
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:loading-status", {
+                    detail: { phase: "unzip", message: "正在解压缩 ZIP…" },
+                }),
+            );
+        } catch (_) {}
         const files = await ZipUtils.unzipFile(file);
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:loading-status", {
+                    detail: {
+                        phase: "unzip",
+                        message: `正在读取 ZIP 内文件（${files.length}）…`,
+                    },
+                }),
+            );
+        } catch (_) {}
         const readFilePromises = Array.from(files).map((file) =>
             this.readFile(file),
         );
@@ -710,6 +795,16 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                 }
             });
 
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("ecad-viewer:loading-status", {
+                        detail: {
+                            phase: "project",
+                            message: "正在解析工程文件…",
+                        },
+                    }),
+                );
+            } catch (_) {}
             await this.#setup_project({ urls: [], blobs });
         } catch (error) {
             console.error("Error while loading ZIP:", error);
@@ -730,7 +825,23 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     }
 
     async load_window_zip_url(url: string) {
-        return this.load_zip(await (await fetch(url)).blob());
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:loading-status", {
+                    detail: { phase: "download", message: "正在下载资源…" },
+                }),
+            );
+        } catch (_) {}
+        const resp = await fetch(url);
+        const blob = await resp.blob();
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:loading-status", {
+                    detail: { phase: "download", message: "下载完成，准备解析…" },
+                }),
+            );
+        } catch (_) {}
+        return this.load_zip(blob);
     }
 
     async load_src() {
@@ -806,6 +917,14 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         this.loading = true;
 
         try {
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("ecad-viewer:loading-status", {
+                        detail: { phase: "project", message: "正在解析工程…" },
+                    }),
+                );
+            } catch (_) {}
+
             // 保存一份 sources 的浅拷贝，避免外部数组/对象被后续修改
             this.#last_sources = {
                 urls: [...(sources.urls ?? [])],
@@ -815,10 +934,54 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                 })),
             };
 
-            await this.#project.load(sources);
+            const forward_status = (e: any) => {
+                try {
+                    const d = e?.detail ?? null;
+                    if (!d) return;
+                    this.dispatchEvent(
+                        new CustomEvent("ecad-viewer:loading-status", {
+                            detail: d,
+                        }),
+                    );
+                } catch (_) {}
+            };
+            try {
+                this.#project.addEventListener(
+                    "load-status",
+                    forward_status as any,
+                );
+            } catch (_) {}
+
+            try {
+                await this.#project.load(sources);
+            } finally {
+                try {
+                    this.#project.removeEventListener(
+                        "load-status",
+                        forward_status as any,
+                    );
+                } catch (_) {}
+            }
 
             this.loaded = true;
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("ecad-viewer:loading-status", {
+                        detail: {
+                            phase: "ui",
+                            message: "正在初始化界面…",
+                        },
+                    }),
+                );
+            } catch (_) {}
             await this.update();
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("ecad-viewer:loading-status", {
+                        detail: { phase: "render", message: "渲染完成" },
+                    }),
+                );
+            } catch (_) {}
 
             // 监听 PCB Viewer 的“选中”事件，用于持久化双击线路等触发的 net 选择
             try {
@@ -1083,6 +1246,10 @@ export class ECadViewer extends KCUIElement implements InputContainer {
             style="display: none"
             multiple />` as HTMLInputElement;
         this.#spinner = html`<ecad-spinner></ecad-spinner>` as HTMLElement;
+        // 将最新状态文案写入 spinner（不依赖外部容器）
+        try {
+            (this.#spinner as any).text = this.#loading_status_text || "";
+        } catch (_) {}
         if (!this.loaded) return this.#spinner;
         this.#spinner.hidden = true;
         this.#tab_contents = {};

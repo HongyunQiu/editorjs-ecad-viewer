@@ -14,6 +14,41 @@ import { KCUIElement } from "./element";
  * element belong.
  */
 export class Spinner extends KCUIElement {
+    static override get observedAttributes() {
+        return ["text"];
+    }
+
+    get text(): string | null {
+        return this.getAttribute("text");
+    }
+
+    set text(v: string | null) {
+        const next = (v ?? "").toString();
+        if (!next) this.removeAttribute("text");
+        else this.setAttribute("text", next);
+        this.#applyText();
+    }
+
+    #applyText() {
+        try {
+            const el = this.renderRoot?.querySelector(
+                ".loading-text",
+            ) as HTMLElement | null;
+            if (!el) return;
+            const t = (this.getAttribute("text") ?? "").trim();
+            el.textContent = t;
+            el.toggleAttribute("hidden", !t);
+        } catch (_) {}
+    }
+
+    override attributeChangedCallback(
+        name: string,
+        _oldValue: string | null,
+        _newValue: string | null,
+    ) {
+        if (name === "text") this.#applyText();
+    }
+
     static override styles = [
         ...KCUIElement.styles,
         css`
@@ -27,8 +62,10 @@ export class Spinner extends KCUIElement {
                 height: 100%; /* Make sure the body takes up the full height of the viewport */
                 width: 100%;
                 display: flex;
+                flex-direction: column;
                 justify-content: center; /* Center horizontally */
                 align-items: center; /* Center vertically */
+                gap: 10px;
             }
 
             .loading-spinner {
@@ -38,6 +75,16 @@ export class Spinner extends KCUIElement {
                 width: 50px;
                 height: 50px;
                 animation: spin 1s linear infinite;
+            }
+
+            .loading-text {
+                max-width: min(520px, 92%);
+                padding: 0 12px;
+                color: rgba(15, 23, 42, 0.75);
+                font-size: 12px;
+                line-height: 1.4;
+                text-align: center;
+                word-break: break-word;
             }
 
             @keyframes spin {
@@ -52,8 +99,13 @@ export class Spinner extends KCUIElement {
         return html`
             <div class="loading-container">
                 <div class="loading-spinner"></div>
+                <div class="loading-text" hidden></div>
             </div>
         `;
+    }
+
+    override renderedCallback(): void | undefined {
+        this.#applyText();
     }
 }
 

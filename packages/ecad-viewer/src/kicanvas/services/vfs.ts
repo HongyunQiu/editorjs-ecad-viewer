@@ -55,6 +55,8 @@ export abstract class VirtualFileSystem {
  */
 export class FetchFileSystem extends VirtualFileSystem {
     private urls: Map<string, URL> = new Map();
+    private inflight: Map<string, Promise<File>> = new Map();
+    private cache: Map<string, File> = new Map();
 
     constructor(urls?: (string | URL)[]) {
         super();
@@ -81,24 +83,44 @@ export class FetchFileSystem extends VirtualFileSystem {
     }
 
     public override async get(name: string): Promise<File> {
+        const cached = this.cache.get(name);
+        if (cached) return cached;
+
+        const existing = this.inflight.get(name);
+        if (existing) return existing;
+
         const url = this.urls.get(name);
 
         if (!url) {
             throw new Error(`File ${name} not found!`);
         }
 
-        const request = new Request(url, { method: "GET" });
-        const response = await fetch(request);
+        const p = (async () => {
+            const request = new Request(url, {
+                method: "GET",
+                // 尽可能利用浏览器缓存，尤其是同一工程重复打开/多处引用时
+                cache: "force-cache",
+            });
+            const response = await fetch(request);
 
-        if (!response.ok) {
-            throw new Error(
-                `Unable to load ${url}: ${response.status} ${response.statusText}`,
-            );
+            if (!response.ok) {
+                throw new Error(
+                    `Unable to load ${url}: ${response.status} ${response.statusText}`,
+                );
+            }
+
+            const blob = await response.blob();
+            const file = new File([blob], name);
+            this.cache.set(name, file);
+            return file;
+        })();
+
+        this.inflight.set(name, p);
+        try {
+            return await p;
+        } finally {
+            this.inflight.delete(name);
         }
-
-        const blob = await response.blob();
-
-        return new File([blob], name);
     }
 
     public async download(name: string) {

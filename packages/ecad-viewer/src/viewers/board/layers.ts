@@ -93,6 +93,31 @@ export enum LayerNames {
     grid = BaseLayerNames.grid,
 }
 
+/**
+ * Virtual layers for overlaying labels (pad numbers, net names, etc.).
+ *
+ * These are not physical KiCad layers. They're controlled via the Objects panel
+ * and persisted in viewState like other object visibilities.
+ */
+export enum LabelLayerNames {
+    pad_numbers = ":Labels:PadNumbers",
+    pad_net_names = ":Labels:PadNetNames",
+    /** Front-side SMD pad labels (respect F.Cu visibility & high-contrast primary layer) */
+    pad_numbers_front = ":Labels:F.Cu:PadNumbers",
+    pad_numbers_back = ":Labels:B.Cu:PadNumbers",
+    pad_net_names_front = ":Labels:F.Cu:PadNetNames",
+    pad_net_names_back = ":Labels:B.Cu:PadNetNames",
+    /** Via net labels (KiCad-like: separate from track labels) */
+    via_net_names = ":Labels:ViaNetNames",
+    /** Legacy single-layer track labels (kept for backward compatibility; unused by default). */
+    track_net_names = ":Labels:TrackNetNames",
+}
+
+/** Track net label layer name for a given copper layer name (e.g. "F.Cu"). */
+export function track_netname_label_layer_for(copper_layer_name: string) {
+    return `:Labels:${copper_layer_name}:TrackNetNames`;
+}
+
 export const HoleLayerNames = [
     LayerNames.non_plated_holes,
     LayerNames.via_holes,
@@ -214,6 +239,66 @@ export class LayerSet extends BaseLayerSet {
 
         for (const l of board.layers) {
             board_layers.set(l.canonical_name, l);
+        }
+
+        // Virtual label layers (drawn above regular layers, below overlay/selection).
+        // Default to hidden (opacity=0) and only show when any copper layer is visible.
+        {
+            const visible = () => this.is_any_copper_layer_visible();
+            const label_color = (this.theme?.aux_items as Color) ?? Color.white;
+
+            const make = (name: string) => {
+                const layer = new ViewLayer(
+                    this,
+                    name,
+                    visible,
+                    false,
+                    (label_color as any)?.copy ? (label_color as any).copy() : label_color,
+                );
+                layer.opacity = 0;
+                return layer;
+            };
+
+            this.add(
+                make(LabelLayerNames.pad_numbers),
+                make(LabelLayerNames.pad_net_names),
+                make(LabelLayerNames.pad_numbers_front),
+                make(LabelLayerNames.pad_numbers_back),
+                make(LabelLayerNames.pad_net_names_front),
+                make(LabelLayerNames.pad_net_names_back),
+                make(LabelLayerNames.via_net_names),
+            );
+
+            // Make pad-side label layers depend on the corresponding copper layer.
+            const tie_to_copper = (label: string, copper: string) => {
+                const l = this.by_name(label);
+                if (!l) return;
+                l.visible = () => {
+                    const cu = this.by_name(copper);
+                    if (!cu?.visible) return false;
+
+                    // High contrast approximation: if a copper layer is highlighted,
+                    // only show labels for that copper layer.
+                    const primary = this.primary_high_contrast_copper_layer_name();
+                    if (primary && primary !== copper) return false;
+                    return true;
+                };
+            };
+
+            tie_to_copper(LabelLayerNames.pad_numbers_front, LayerNames.f_cu);
+            tie_to_copper(LabelLayerNames.pad_net_names_front, LayerNames.f_cu);
+            tie_to_copper(LabelLayerNames.pad_numbers_back, LayerNames.b_cu);
+            tie_to_copper(LabelLayerNames.pad_net_names_back, LayerNames.b_cu);
+
+            // Per-copper-layer track netname label layers (KiCad-like)
+            for (const [layer_name] of board_layers) {
+                if (!is_copper(layer_name)) continue;
+
+                const layer = make(track_netname_label_layer_for(layer_name));
+                // Only show track labels when the referenced copper layer is visible.
+                layer.visible = () => this.by_name(layer_name)?.visible ?? false;
+                this.add(layer);
+            }
         }
 
         for (const layer_name of Object.values(LayerNames)) {
@@ -588,5 +673,28 @@ export class LayerSet extends BaseLayerSet {
         );
 
         super.highlight(matching_layers);
+    }
+
+    /**
+     * In KiCad's "high contrast" mode, a single primary copper layer is used for visibility
+     * decisions (e.g. net labels on dimmed layers are hidden). In KiCanvas we approximate
+     * this using the currently highlighted copper layer, if any.
+     */
+    primary_high_contrast_copper_layer_name(): string | null {
+        for (const cu of this.copper_layers()) {
+            if (cu.highlighted) return cu.name;
+        }
+        return null;
+    }
+
+    /**
+     * @yields all per-copper-layer track netname label layers currently present.
+     */
+    *track_netname_label_layers(): Generator<ViewLayer, void, unknown> {
+        for (const cu of this.copper_layers()) {
+            const name = track_netname_label_layer_for(cu.name);
+            const layer = this.by_name(name);
+            if (layer) yield layer;
+        }
     }
 }

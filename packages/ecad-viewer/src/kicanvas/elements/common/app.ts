@@ -68,6 +68,20 @@ export abstract class KCViewerAppElement<
     #fitter_menu: HTMLElement;
     #placeholder = html`<ecad-spinner></ecad-spinner>` as HTMLElement;
     #content?: HTMLElement;
+    #placeholder_text = "";
+
+    #set_placeholder_text(text: string) {
+        const t = String(text || "");
+        this.#placeholder_text = t;
+        try {
+            (this.#placeholder as any).text = t;
+        } catch (_) {
+            try {
+                if (t) this.#placeholder.setAttribute("text", t);
+                else this.#placeholder.removeAttribute("text");
+            } catch (_) {}
+        }
+    }
 
     public set tabMenuHidden(v: boolean) {
         this.#fitter_menu.hidden = v;
@@ -130,6 +144,25 @@ export abstract class KCViewerAppElement<
                     console.warn("Unknown button", e);
             }
         });
+
+        // 当 viewer 内部在加载/渲染时派发状态事件，显示在占位 spinner 下方。
+        // 只在 placeholder 可见时更新，避免影响已渲染内容阶段。
+        try {
+            this.addDisposable(
+                this.addEventListener(
+                    "ecad-viewer:loading-status" as any,
+                    (e: any) => {
+                        try {
+                            if (this.#placeholder.hidden) return;
+                            const msg = e?.detail?.message || "";
+                            if (!msg) return;
+                            this.#set_placeholder_text(String(msg));
+                        } catch (_) {}
+                    },
+                    { capture: true } as any,
+                ) as any,
+            );
+        } catch (_) {}
     }
 
     protected abstract on_viewer_select(
@@ -142,16 +175,24 @@ export abstract class KCViewerAppElement<
     override async load(src: KicadAssert) {
         await this.viewerReady;
         if (this.can_load(src)) {
+            // 在真实渲染开始前先显示 placeholder，并给一条初始文案
+            if (this.#content) this.#content.hidden = true;
+            this.#placeholder.hidden = false;
+            if (!this.#placeholder_text) {
+                this.#set_placeholder_text("正在渲染…");
+            }
             await this.#viewer_elm.load(src);
             if (this.#content) {
                 this.#content.hidden = false;
             }
             this.#placeholder.hidden = true;
+            this.#set_placeholder_text("");
         } else {
             if (this.#content) {
                 this.#content.hidden = true;
             }
             this.#placeholder.hidden = false;
+            this.#set_placeholder_text("当前页不可加载");
         }
     }
 

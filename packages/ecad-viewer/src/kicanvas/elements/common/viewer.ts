@@ -9,6 +9,7 @@ import { attribute, html } from "../../../base/web-components";
 import { KCUIElement } from "../../../kc-ui";
 import { KiCanvasLoadEvent } from "../../../viewers/base/events";
 import type { Viewer } from "../../../viewers/base/viewer";
+import { ViewerType } from "../../../viewers/base/viewer";
 import { Preferences, WithPreferences } from "../../preferences";
 import themes from "../../themes";
 import type { KicadAssert } from "./app";
@@ -40,10 +41,51 @@ export abstract class KCViewerElement<
 
             await this.viewer.setup();
 
+            // Bridge internal viewer loading status events to DOM so outer containers
+            // (e.g. <ecad-viewer> host, EditorJS wrapper) can show textual status.
+            try {
+                this.addDisposable(
+                    this.viewer.addEventListener(
+                        "kicanvas:load-status" as any,
+                        (e: any) => {
+                            try {
+                                const detail = e?.detail ?? null;
+                                if (!detail) return;
+                                this.dispatchEvent(
+                                    new CustomEvent(
+                                        "ecad-viewer:loading-status",
+                                        {
+                                            detail,
+                                            bubbles: true,
+                                            composed: true,
+                                        },
+                                    ),
+                                );
+                            } catch (_) {}
+                        },
+                    ) as any,
+                );
+            } catch (_) {}
+
             this.addDisposable(
                 this.viewer.addEventListener(KiCanvasLoadEvent.type, () => {
                     this.loaded = true;
                     this.dispatchEvent(new KiCanvasLoadEvent());
+                    try {
+                        const msg =
+                            this.viewer?.type === ViewerType.PCB
+                                ? "PCB 渲染完成"
+                                : this.viewer?.type === ViewerType.Schematic
+                                  ? "原理图渲染完成"
+                                  : "渲染完成";
+                        this.dispatchEvent(
+                            new CustomEvent("ecad-viewer:loading-status", {
+                                detail: { phase: "ready", message: msg },
+                                bubbles: true,
+                                composed: true,
+                            }),
+                        );
+                    } catch (_) {}
                 }),
             );
         })();
@@ -79,6 +121,25 @@ export abstract class KCViewerElement<
 
     override async load(src: KicadAssert) {
         this.loaded = false;
+        try {
+            const msg =
+                this.viewer?.type === ViewerType.PCB
+                    ? "正在渲染 PCB（可能需要较长时间）…"
+                    : this.viewer?.type === ViewerType.Schematic
+                      ? "正在渲染原理图（可能需要较长时间）…"
+                      : "正在渲染（可能需要较长时间）…";
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:loading-status", {
+                    detail: { phase: "viewer-load", message: msg },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+            // Yield a frame so the outer UI can paint status text
+            await new Promise<void>((resolve) =>
+                window.requestAnimationFrame(() => resolve()),
+            );
+        } catch (_) {}
         await this.viewer.load(src);
     }
 

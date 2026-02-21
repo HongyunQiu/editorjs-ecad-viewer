@@ -190,11 +190,45 @@ export class Project extends EventTarget implements IDisposable {
     }
 
     public async load(sources: EcadSources) {
+        const emit_status = (detail: any) => {
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("load-status", {
+                        detail,
+                    }),
+                );
+            } catch (_) {}
+        };
+
+        const basename = (name: string) => {
+            try {
+                const parts = String(name || "").split("/");
+                return parts.length ? parts[parts.length - 1] : String(name || "");
+            } catch (_) {
+                return String(name || "");
+            }
+        };
+
+        let last_emit_at = 0;
+        const emit_throttled = (detail: any, force = false) => {
+            const t = nowMs();
+            if (!force && t - last_emit_at < 120) return;
+            last_emit_at = t;
+            emit_status(detail);
+        };
+
+        emit_throttled({ phase: "start", message: "正在读取工程文件…" }, true);
+
         const key = sourcesKey(sources);
         const cached = projectSnapshotCache.get(key);
         if (cached && nowMs() - cached.lastUsedAt <= PROJECT_CACHE_TTL_MS) {
             cached.lastUsedAt = nowMs();
             evictProjectCacheIfNeeded();
+
+            emit_throttled(
+                { phase: "cache", message: "命中缓存，正在恢复解析结果…" },
+                true,
+            );
 
             // Reset current state
             this.dispose();
@@ -244,44 +278,142 @@ export class Project extends EventTarget implements IDisposable {
                     detail: this,
                 }),
             );
+            emit_throttled(
+                { phase: "done", message: "已从缓存恢复（即将渲染）" },
+                true,
+            );
             return;
         }
 
         this._fs = new FetchFileSystem(sources.urls);
 
-        const promises = [];
+        const fs_files = Array.from(this._fs.list());
+        const blobs = (sources.blobs ?? []).filter(
+            (b) => b && !b.filename.startsWith("."),
+        );
+        const total = fs_files.length + blobs.length;
+        let done = 0;
 
-        for (const filename of this._fs.list()) {
-            promises.push(this._load_file(filename));
+        const emit_progress = (message: string, extra?: any, force = false) => {
+            emit_throttled(
+                {
+                    phase: "read",
+                    message,
+                    done,
+                    total,
+                    ...(extra ?? {}),
+                },
+                force,
+            );
+        };
+
+        const track = async <T>(
+            p: Promise<T>,
+            filename: string,
+        ): Promise<T> => {
+            try {
+                const res = await p;
+                done += 1;
+                emit_progress(
+                    `读取文件 ${done}/${Math.max(total, 1)}：${basename(
+                        filename,
+                    )}`,
+                    { filename },
+                    done >= total,
+                );
+                return res;
+            } catch (e) {
+                done += 1;
+                emit_progress(
+                    `读取失败 ${done}/${Math.max(total, 1)}：${basename(
+                        filename,
+                    )}`,
+                    { filename, error: String((e as any)?.message || e) },
+                    true,
+                );
+                throw e;
+            }
+        };
+
+        emit_progress(`开始读取与解析文件（0/${Math.max(total, 1)}）`, null, true);
+
+        const promises: Array<Promise<any>> = [];
+
+        for (const filename of fs_files) {
+            promises.push(track(this._load_file(filename), filename));
         }
 
-        for (const blob of sources.blobs) {
-            if (blob.filename.startsWith(".")) continue;
+        for (const blob of blobs) {
             if (blob.filename.endsWith(".kicad_pcb")) {
-                promises.push(this._load_blob(KicadPCB, blob));
+                promises.push(track(this._load_blob(KicadPCB, blob), blob.filename));
             } else if (blob.filename.endsWith(".kicad_sch")) {
-                promises.push(this._load_blob(KicadSch, blob));
+                promises.push(track(this._load_blob(KicadSch, blob), blob.filename));
             } else if (blob.filename.endsWith(".kicad_pro")) {
+                emit_throttled(
+                    {
+                        phase: "meta",
+                        message: `解析工程设置：${basename(blob.filename)}`,
+                        done,
+                        total,
+                        filename: blob.filename,
+                    },
+                    true,
+                );
                 this._project_name = blob.filename.slice(
                     0,
                     blob.filename.length - ".kicad_pro".length,
                 );
                 const data = JSON.parse(blob.content);
                 this.settings = ProjectSettings.load(data);
+                done += 1;
+                emit_progress(
+                    `读取文件 ${done}/${Math.max(total, 1)}：${basename(
+                        blob.filename,
+                    )}`,
+                    { filename: blob.filename },
+                    done >= total,
+                );
+            } else {
+                // 未识别类型：视为已处理，避免进度卡住
+                done += 1;
+                emit_progress(
+                    `跳过文件 ${done}/${Math.max(total, 1)}：${basename(
+                        blob.filename,
+                    )}`,
+                    { filename: blob.filename },
+                    done >= total,
+                );
             }
         }
 
         await Promise.all(promises);
 
         if (this._found_cjk) {
+            emit_throttled(
+                { phase: "glyph", message: "检测到中文字符，正在加载字形库…" },
+                true,
+            );
             await Project.import_cjk_glyphs();
+            emit_throttled(
+                { phase: "glyph", message: "字形库加载完成" },
+                true,
+            );
         }
 
         let has_root_sch = false;
 
-        if (this.has_schematics)
+        if (this.has_schematics) {
+            emit_throttled(
+                { phase: "schematic", message: "正在分析原理图层级…" },
+                true,
+            );
             has_root_sch = this._determine_schematic_hierarchy();
+        }
 
+        emit_throttled(
+            { phase: "bom", message: "正在生成 BOM…" },
+            true,
+        );
         const bom_items = (() => {
             if (this.has_schematics) {
                 const sch_visitor = new SchematicBomVisitor();
@@ -309,6 +441,10 @@ export class Project extends EventTarget implements IDisposable {
         })();
         this._sort_bom(bom_items);
 
+        emit_throttled(
+            { phase: "finalize", message: "解析完成，正在准备渲染…" },
+            true,
+        );
         this.loaded.open();
 
         this.dispatchEvent(
@@ -408,6 +544,28 @@ export class Project extends EventTarget implements IDisposable {
             return this._files_by_name.get(filename);
         }
 
+        try {
+            const base = (() => {
+                try {
+                    const parts = String(filename || "").split("/");
+                    return parts.length
+                        ? parts[parts.length - 1]
+                        : String(filename || "");
+                } catch (_) {
+                    return String(filename || "");
+                }
+            })();
+            this.dispatchEvent(
+                new CustomEvent("load-status", {
+                    detail: {
+                        phase: "fetch",
+                        filename,
+                        message: `正在下载文件内容：${base}`,
+                    },
+                }),
+            );
+        } catch (_) {}
+
         const text = await this.get_file_text(filename);
         return this._load_blob(document_class, {
             filename,
@@ -434,7 +592,58 @@ export class Project extends EventTarget implements IDisposable {
             return this._files_by_name.get(blob.filename);
         }
         const filename = blob.filename;
+        const base = (() => {
+            try {
+                const parts = String(filename || "").split("/");
+                return parts.length ? parts[parts.length - 1] : String(filename || "");
+            } catch (_) {
+                return String(filename || "");
+            }
+        })();
+
+        // 这一步（尤其是 .kicad_pcb/.kicad_sch）会执行 tokenizer(listify) + parse_expr，
+        // 对大工程来说是主要 CPU 耗时点。这里先发一条状态，避免 UI 长时间无变化。
+        const heavy =
+            filename.endsWith(".kicad_pcb") ||
+            filename.endsWith(".kicad_sch") ||
+            filename.endsWith(".kicad_pro");
+        let t0 = 0;
+        if (heavy) {
+            t0 = nowMs();
+            try {
+                this.dispatchEvent(
+                    new CustomEvent("load-status", {
+                        detail: {
+                            phase: "parse-start",
+                            filename,
+                            message: `正在解析：${base}（可能需要较长时间）…`,
+                        },
+                    }),
+                );
+            } catch (_) {}
+        }
+
         const doc = new document_class(filename, file_content);
+
+        if (heavy && t0) {
+            const dt = Math.max(0, nowMs() - t0);
+            // 小文件会很快完成，避免刷屏；但对大文件给出明确耗时
+            if (dt >= 400) {
+                try {
+                    const sec = Math.round((dt / 1000) * 10) / 10;
+                    this.dispatchEvent(
+                        new CustomEvent("load-status", {
+                            detail: {
+                                phase: "parse-done",
+                                filename,
+                                durationMs: dt,
+                                message: `解析完成：${base}（耗时 ${sec}s）`,
+                            },
+                        }),
+                    );
+                } catch (_) {}
+            }
+        }
         this._files_by_name.set(filename, doc);
         if (doc instanceof KicadPCB) this._pcb.push(doc);
         else {

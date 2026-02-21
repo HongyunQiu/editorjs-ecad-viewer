@@ -1,6 +1,8 @@
 import { mkdir, copyFile, rm, access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
+import { readdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
 const root = process.cwd();
 const pkgEditor = path.join(root, 'packages', 'editorjs-ecad-viewer');
@@ -34,6 +36,20 @@ async function safeCopy(src, dest) {
   await mkdir(path.dirname(dest), { recursive: true });
   await copyFile(src, dest);
   console.log(`copied: ${path.relative(root, src)} -> ${path.relative(root, dest)}`);
+}
+
+async function safeCopyDir(srcDir, destDir) {
+  await mkdir(destDir, { recursive: true });
+  const entries = await readdir(srcDir, { withFileTypes: true });
+  for (const ent of entries) {
+    const src = path.join(srcDir, ent.name);
+    const dest = path.join(destDir, ent.name);
+    if (ent.isDirectory()) {
+      await safeCopyDir(src, dest);
+    } else if (ent.isFile()) {
+      await safeCopy(src, dest);
+    }
+  }
 }
 
 async function main() {
@@ -86,6 +102,35 @@ async function main() {
     await safeCopy(path.join(outRootEcadDir, 'ecad-viewer.js'), path.join(qnotesVendorEcadDir, 'ecad-viewer.js'));
     await safeCopy(path.join(outRootEcadDir, '3d-viewer.js'), path.join(qnotesVendorEcadDir, '3d-viewer.js'));
     await safeCopy(path.join(outRootEcadDir, 'glyph-full.js'), path.join(qnotesVendorEcadDir, 'glyph-full.js'));
+
+    // three 本地化：复制 three.module.js + examples/jsm（含 draco/basis 等 3D 解码器资源）。
+    // QNotes/public/index.html 的 importmap 会指向 ./vendor/three/...
+    try {
+      // 注意：three 使用了 exports，无法直接 resolve 'three/package.json'。
+      // 这里 resolve 'three' 本身（通常指向 build/three.module.js），再向上推导包根目录。
+      const threeEntryUrl = import.meta.resolve('three');
+      const threeEntryPath = fileURLToPath(threeEntryUrl);
+      const threeRoot = path.dirname(path.dirname(threeEntryPath));
+      const qnotesThreeDir = path.join(qnotesPublicDir, 'vendor', 'three');
+
+      await safeCopy(
+        path.join(threeRoot, 'build', 'three.module.js'),
+        path.join(qnotesThreeDir, 'build', 'three.module.js'),
+      );
+
+      // 仅复制 3D 需要的子目录（比全量 jsm 更小）
+      const jsmRoot = path.join(threeRoot, 'examples', 'jsm');
+      const jsmOut = path.join(qnotesThreeDir, 'examples', 'jsm');
+      await safeCopyDir(path.join(jsmRoot, 'loaders'), path.join(jsmOut, 'loaders'));
+      await safeCopyDir(path.join(jsmRoot, 'controls'), path.join(jsmOut, 'controls'));
+      await safeCopyDir(path.join(jsmRoot, 'environments'), path.join(jsmOut, 'environments'));
+      await safeCopyDir(path.join(jsmRoot, 'libs'), path.join(jsmOut, 'libs'));
+      await safeCopyDir(path.join(jsmRoot, 'utils'), path.join(jsmOut, 'utils'));
+
+      console.log('已同步 three 静态资源到 qnotes vendor/three。');
+    } catch (e) {
+      console.log('未能复制 three 静态资源（可能未安装 three），将继续使用现有 importmap：', String(e?.message || e));
+    }
 
     console.log('已同步复制到 qnotes vendor 目录。');
   } else {

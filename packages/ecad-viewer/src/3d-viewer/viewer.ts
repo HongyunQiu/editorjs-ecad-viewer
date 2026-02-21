@@ -41,12 +41,19 @@ import { environments } from "./environments";
 const DEFAULT_CAMERA = "[default]";
 
 const MANAGER = new LoadingManager();
-const THREE_PATH = `https://unpkg.com/three@0.${REVISION}.x`;
+// 优先使用本地 three 资源，避免弱网/离线导致 3D 解码器拉取失败。
+// 约定 QNotes 将 three 静态资源放在：/vendor/three/...
+// ecad-viewer 的 3D bundle 位于：/vendor/editorjs-ecad-viewer/ecad_viewer/3d-viewer.js
+// 因此从本文件相对路径可定位到：../../three/examples/jsm/libs/
+const THREE_LIBS_BASE = new URL(
+    "../../three/examples/jsm/libs/",
+    import.meta.url,
+).toString();
 const DRACO_LOADER = new DRACOLoader(MANAGER).setDecoderPath(
-    `${THREE_PATH}/examples/jsm/libs/draco/gltf/`,
+    `${THREE_LIBS_BASE}draco/gltf/`,
 );
 const KTX2_LOADER = new KTX2Loader(MANAGER).setTranscoderPath(
-    `${THREE_PATH}/examples/jsm/libs/basis/`,
+    `${THREE_LIBS_BASE}basis/`,
 );
 
 Cache.enabled = true;

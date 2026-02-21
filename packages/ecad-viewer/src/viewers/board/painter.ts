@@ -13,12 +13,14 @@
 import { Angle, Arc, BBox, Matrix3, Vec2 } from "../../base/math";
 import { Circle, Color, Polygon, Polyline, Renderer } from "../../graphics";
 import * as board_items from "../../kicad/board";
-import { EDAText, StrokeFont } from "../../kicad/text";
+import { unescape_string } from "../../kicad/common";
+import { EDAText, StrokeFont, TextAttributes } from "../../kicad/text";
 import { DocumentPainter } from "../base/painter";
 import {
     CopperVirtualLayerNames,
     FabVirtualLayerNames,
     LayerNames,
+    LabelLayerNames,
     LayerSet,
     ViewLayer,
     copper_layers_between,
@@ -696,6 +698,287 @@ export class BoardPainter extends DocumentPainter {
             new FpTextPainter(this, gfx),
             new DimensionPainter(this, gfx),
         ];
+    }
+
+    override paint(document: board_items.KicadPCB) {
+        super.paint(document);
+        this.#paint_static_pad_labels(document);
+    }
+
+    #paint_static_pad_labels(board: board_items.KicadPCB) {
+        const pad_numbers_layer = this.layers.by_name(LabelLayerNames.pad_numbers);
+        const pad_netnames_layer = this.layers.by_name(LabelLayerNames.pad_net_names);
+        const pad_numbers_layer_f = this.layers.by_name(LabelLayerNames.pad_numbers_front);
+        const pad_numbers_layer_b = this.layers.by_name(LabelLayerNames.pad_numbers_back);
+        const pad_netnames_layer_f = this.layers.by_name(LabelLayerNames.pad_net_names_front);
+        const pad_netnames_layer_b = this.layers.by_name(LabelLayerNames.pad_net_names_back);
+
+        if (
+            !pad_numbers_layer &&
+            !pad_netnames_layer &&
+            !pad_numbers_layer_f &&
+            !pad_numbers_layer_b &&
+            !pad_netnames_layer_f &&
+            !pad_netnames_layer_b
+        )
+            return;
+
+        // Rebuild label layers' graphics (items/bboxes not used for these layers).
+        if (pad_numbers_layer) pad_numbers_layer.clear();
+        if (pad_netnames_layer) pad_netnames_layer.clear();
+        if (pad_numbers_layer_f) pad_numbers_layer_f.clear();
+        if (pad_numbers_layer_b) pad_numbers_layer_b.clear();
+        if (pad_netnames_layer_f) pad_netnames_layer_f.clear();
+        if (pad_netnames_layer_b) pad_netnames_layer_b.clear();
+
+        const mmToIU = 10000;
+
+        const char_count = (s: string) => Array.from(s || "").length;
+
+        const strip_net_path = (name: string) => {
+            const idx = name.lastIndexOf("/");
+            return idx >= 0 ? name.slice(idx + 1) : name;
+        };
+
+        const normalize_unconnected_netname = (name: string) => {
+            if (!name) return name;
+            return name.toLowerCase().startsWith("unconnected") ? "x" : name;
+        };
+
+        const normalize_upright_deg = (deg: number) => {
+            let a = deg;
+            while (a > 90) a -= 180;
+            while (a <= -90) a += 180;
+            return a;
+        };
+
+        const draw_text = (
+            layer: ViewLayer,
+            text: string,
+            pos_mm: Vec2,
+            glyph_w_mm: number,
+            glyph_h_mm: number,
+            stroke_w_mm: number,
+            angle_deg: number,
+        ) => {
+            if (!text) return;
+
+            const attrs = new TextAttributes();
+            attrs.h_align = "center";
+            attrs.v_align = "center";
+            attrs.multiline = false;
+            attrs.keep_upright = false;
+            attrs.angle = Angle.from_degrees(angle_deg);
+            attrs.color = layer.color;
+            attrs.size = new Vec2(glyph_w_mm * mmToIU, glyph_h_mm * mmToIU);
+            attrs.stroke_width = stroke_w_mm * mmToIU;
+
+            const pos_iu = new Vec2(pos_mm.x * mmToIU, pos_mm.y * mmToIU);
+
+            StrokeFont.default().draw(this.gfx, text, pos_iu, attrs);
+        };
+
+        const paint_pad_numbers_into = (layer: ViewLayer, fp: board_items.Footprint, pad: any) => {
+            const pad_number = unescape_string(pad.number || "");
+            if (!pad_number) return;
+
+            const bb = pad.bbox;
+            if (!bb.valid) return;
+
+            const center = bb.center;
+            let padsize = new Vec2(bb.w, bb.h);
+
+            // Limit bbox bloat for rotated non-custom pads (KiCad does something similar).
+            if (pad.shape !== "custom") {
+                const limit =
+                    Math.min(pad.size?.x ?? padsize.x, pad.size?.y ?? padsize.y) * 1.1;
+                if (padsize.x > limit && padsize.y > limit) {
+                    padsize = new Vec2(limit, limit);
+                }
+            }
+
+            // If narrow, rotate labels to fit better (approx. KiCad behavior).
+            let angle_deg = 0;
+            if (padsize.x < padsize.y * 0.95) {
+                angle_deg = -90;
+                padsize = new Vec2(padsize.y, padsize.x);
+            }
+
+            let size_mm = padsize.y;
+            size_mm = Math.min(size_mm, 8); // KiCad has a MAX_FONT_SIZE; keep sane here.
+
+            // If also showing netnames, KiCad shrinks both. We'll match that when netname exists.
+            const netname = normalize_unconnected_netname(
+                strip_net_path(unescape_string(pad.net?.name || "")),
+            );
+            const both_lines = !!netname;
+            let y_offset_num = 0;
+
+            if (both_lines) {
+                size_mm = size_mm / 2.5;
+                y_offset_num = size_mm / 1.7;
+            }
+
+            const tsize =
+                Math.min(
+                    (1.5 * padsize.x) / Math.max(char_count(pad_number), 3),
+                    size_mm,
+                ) * 0.85;
+
+            const xscale = 0.9;
+            const glyph_w = tsize * xscale;
+            const glyph_h = tsize;
+            const stroke_w = glyph_w / 6.0;
+
+            // Local offset (pad local after optional rotation), then rotate into world.
+            const rot = Angle.from_degrees(angle_deg);
+            const offset_world = rot.rotate_point(
+                new Vec2(0, -y_offset_num),
+                new Vec2(0, 0),
+            );
+
+            draw_text(
+                layer,
+                pad_number,
+                center.add(offset_world),
+                glyph_w,
+                glyph_h,
+                stroke_w,
+                normalize_upright_deg(angle_deg),
+            );
+        };
+
+        // Paint pad numbers into: global (through-hole) + front/back (SMD)
+        const numbers_layers_to_paint: Array<[ViewLayer | undefined, string]> = [
+            [pad_numbers_layer, "global"],
+            [pad_numbers_layer_f, "front"],
+            [pad_numbers_layer_b, "back"],
+        ];
+
+        for (const [layer, kind] of numbers_layers_to_paint) {
+            if (!layer) continue;
+
+            this.gfx.start_layer(layer.name);
+            this.gfx.state.push();
+            this.gfx.state.matrix = Matrix3.identity();
+
+            for (const fp of board.footprints) {
+                for (const pad of fp.pads) {
+                    const isSmd = pad.type === "smd" || pad.type === "connect";
+                    const isTh = pad.type === "thru_hole" || pad.type === "np_thru_hole";
+
+                    if (kind === "global" && !isTh) continue;
+                    if (kind === "front" && (!isSmd || fp.layer !== "F.Cu")) continue;
+                    if (kind === "back" && (!isSmd || fp.layer !== "B.Cu")) continue;
+
+                    paint_pad_numbers_into(layer, fp, pad);
+                }
+            }
+
+            this.gfx.state.pop();
+            layer.graphics = this.gfx.end_layer();
+            layer.graphics.composite_operation = "source-over";
+        }
+
+        const paint_pad_netname_into = (layer: ViewLayer, fp: board_items.Footprint, pad: any) => {
+            const netname = normalize_unconnected_netname(
+                strip_net_path(unescape_string(pad.net?.name || "")),
+            );
+            if (!netname) return;
+
+            const bb = pad.bbox;
+            if (!bb.valid) return;
+
+            const center = bb.center;
+            let padsize = new Vec2(bb.w, bb.h);
+
+            if (pad.shape !== "custom") {
+                const limit =
+                    Math.min(pad.size?.x ?? padsize.x, pad.size?.y ?? padsize.y) * 1.1;
+                if (padsize.x > limit && padsize.y > limit) {
+                    padsize = new Vec2(limit, limit);
+                }
+            }
+
+            let angle_deg = 0;
+            if (padsize.x < padsize.y * 0.95) {
+                angle_deg = -90;
+                padsize = new Vec2(padsize.y, padsize.x);
+            }
+
+            let size_mm = padsize.y;
+            size_mm = Math.min(size_mm, 8);
+
+            const pad_number = unescape_string(pad.number || "");
+            const both_lines = !!pad_number;
+            let y_offset_net = 0;
+
+            if (both_lines) {
+                size_mm = size_mm / 2.5;
+                y_offset_net = size_mm / 1.4;
+            }
+
+            // KiCad uses at least 5 chars (and +1) to keep short nets readable.
+            let tsize = (1.5 * padsize.x) / Math.max(char_count(netname) + 1, 5);
+            tsize = Math.min(tsize, size_mm);
+            tsize *= 0.85;
+
+            if (pad.shape === "circle" || pad.shape === "oval") {
+                tsize *= 0.9;
+            }
+
+            const xscale = 0.9;
+            const glyph_w = tsize * xscale;
+            const glyph_h = tsize;
+            const stroke_w = glyph_w / 6.0;
+
+            const rot = Angle.from_degrees(angle_deg);
+            const offset_world = rot.rotate_point(
+                new Vec2(0, Math.min(tsize * 1.4, y_offset_net)),
+                new Vec2(0, 0),
+            );
+
+            draw_text(
+                layer,
+                netname,
+                center.add(offset_world),
+                glyph_w,
+                glyph_h,
+                stroke_w,
+                normalize_upright_deg(angle_deg),
+            );
+        };
+
+        const net_layers_to_paint: Array<[ViewLayer | undefined, string]> = [
+            [pad_netnames_layer, "global"],
+            [pad_netnames_layer_f, "front"],
+            [pad_netnames_layer_b, "back"],
+        ];
+
+        for (const [layer, kind] of net_layers_to_paint) {
+            if (!layer) continue;
+
+            this.gfx.start_layer(layer.name);
+            this.gfx.state.push();
+            this.gfx.state.matrix = Matrix3.identity();
+
+            for (const fp of board.footprints) {
+                for (const pad of fp.pads) {
+                    const isSmd = pad.type === "smd" || pad.type === "connect";
+                    const isTh = pad.type === "thru_hole" || pad.type === "np_thru_hole";
+
+                    if (kind === "global" && !isTh) continue;
+                    if (kind === "front" && (!isSmd || fp.layer !== "F.Cu")) continue;
+                    if (kind === "back" && (!isSmd || fp.layer !== "B.Cu")) continue;
+
+                    paint_pad_netname_into(layer, fp, pad);
+                }
+            }
+
+            this.gfx.state.pop();
+            layer.graphics = this.gfx.end_layer();
+            layer.graphics.composite_operation = "source-over";
+        }
     }
 
     // Used to filter out items by net when highlighting nets. Painters

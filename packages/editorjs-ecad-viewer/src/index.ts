@@ -26,7 +26,8 @@ function normalizeHost(input: string): string {
   const fallback = 'http://localhost:8080/';
   if (!input) return fallback;
   try {
-    const u = new URL(input);
+    // 允许相对路径（如 "vendor/editorjs-ecad-viewer/"），以当前页面为基准解析
+    const u = new URL(input, window.location.href);
     if (!u.pathname || u.pathname === '/') u.pathname = '/';
     return u.toString();
   } catch {
@@ -40,6 +41,52 @@ function toModuleUrl(host: string): string {
 }
 
 const loadedModules = new Set<string>();
+
+function tryParseUrl(input: string): URL | null {
+  try {
+    return new URL(input, window.location.href);
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeBundledVendorHost(u: URL): boolean {
+  // 典型路径：/vendor/editorjs-ecad-viewer/
+  return u.pathname.includes('/vendor/editorjs-ecad-viewer/');
+}
+
+function chooseViewerHostUrl(
+  dataHost: string | undefined,
+  configHost: string | undefined,
+): string {
+  const fallback = 'http://localhost:8080/';
+  const pageOrigin = (() => {
+    try {
+      return window.location.origin;
+    } catch {
+      return '';
+    }
+  })();
+
+  const d = dataHost ? tryParseUrl(dataHost) : null;
+  const c = configHost ? tryParseUrl(configHost) : null;
+
+  // 如果块数据里保存的是“本地 vendor 路径”，但 origin 与当前页面不一致（例如从 172.* 打开创建，后来用 localhost 打开），
+  // 则优先使用当前页面下的 vendor（configHost）以避免跨域 dynamic import 失败。
+  if (d && pageOrigin && d.origin !== pageOrigin && looksLikeBundledVendorHost(d)) {
+    if (c) return c.toString();
+    // 没有 configHost 时，直接把 pathname rebased 到当前 origin
+    try {
+      const rebased = new URL(d.pathname, window.location.href);
+      if (!rebased.pathname.endsWith('/')) rebased.pathname += '/';
+      return rebased.toString();
+    } catch {
+      // ignore
+    }
+  }
+
+  return (dataHost || configHost || fallback) as string;
+}
 
 function normalizeModuleKey(moduleUrl: string): string {
   try {
@@ -166,6 +213,12 @@ export default class EcadViewerTool implements BlockTool {
   private hintEl?: HTMLElement;
   private mountEl?: HTMLElement;
   private currentViewerEl?: HTMLElement;
+  private statusEl?: HTMLElement;
+  private statusTextEl?: HTMLElement;
+  private statusAbort?: AbortController;
+  private statusTimer: number | null = null;
+  private statusBaseText = '';
+  private statusStartedAt = 0;
 
   static get isReadOnlySupported() {
     return true;
@@ -183,12 +236,33 @@ export default class EcadViewerTool implements BlockTool {
     this.config = config || {};
     this.readOnly = readOnly;
 
-    const host = data?.viewerHostUrl || this.config.defaultViewerHostUrl || 'http://localhost:8080/';
+    const host = chooseViewerHostUrl(
+      data?.viewerHostUrl,
+      this.config.defaultViewerHostUrl,
+    );
+    const normalizedHost = normalizeHost(host);
+    const moduleFromData = data?.moduleUrl || '';
+    let moduleUrl = moduleFromData || toModuleUrl(normalizedHost);
+
+    // 若数据里保存了跨 origin 的 vendor moduleUrl，则重算为当前 host 下的 moduleUrl
+    try {
+      const pageOrigin = window.location.origin;
+      const mu = tryParseUrl(moduleUrl);
+      if (
+        mu &&
+        pageOrigin &&
+        mu.origin !== pageOrigin &&
+        mu.pathname.includes('/vendor/editorjs-ecad-viewer/ecad_viewer/ecad-viewer.js')
+      ) {
+        moduleUrl = toModuleUrl(normalizedHost);
+      }
+    } catch (_) {}
+
     this.data = {
-      viewerHostUrl: normalizeHost(host),
+      viewerHostUrl: normalizedHost,
       sourceUrl: data?.sourceUrl || this.config.defaultSourceUrl || '',
       isBom: typeof data?.isBom === 'boolean' ? data.isBom : !!this.config.defaultIsBom,
-      moduleUrl: data?.moduleUrl || toModuleUrl(host),
+      moduleUrl,
       viewState: (data as any)?.viewState,
     };
   }
@@ -238,11 +312,19 @@ export default class EcadViewerTool implements BlockTool {
       this.mountEl = document.createElement('div');
       this.mountEl.className = 'cdx-ecad-viewer__preview';
 
+      this.statusEl = document.createElement('div');
+      this.statusEl.className = 'cdx-ecad-viewer__status';
+      this.statusTextEl = document.createElement('div');
+      this.statusTextEl.className = 'cdx-ecad-viewer__statusText';
+      this.statusEl.appendChild(this.statusTextEl);
+      this.mountEl.appendChild(this.statusEl);
+
       wrapper.append(toolbar, this.mountEl);
 
       this.refreshNativeViewer().catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
         this.setHint(`加载失败：${msg}`);
+        this.showStatus(`加载失败：${msg}`);
       });
       return wrapper;
     } catch (e) {
@@ -358,16 +440,60 @@ export default class EcadViewerTool implements BlockTool {
     }
   }
 
+  private showStatus(baseText: string) {
+    this.statusBaseText = String(baseText || '');
+    if (this.statusEl) this.statusEl.style.display = this.statusBaseText ? 'flex' : 'none';
+    this.updateStatusText();
+  }
+
+  private hideStatus() {
+    if (this.statusEl) this.statusEl.style.display = 'none';
+  }
+
+  private updateStatusText() {
+    if (!this.statusTextEl) return;
+    const base = this.statusBaseText || '';
+    if (!base) {
+      this.statusTextEl.textContent = '';
+      return;
+    }
+    const sec = this.statusStartedAt ? Math.max(0, Math.floor((Date.now() - this.statusStartedAt) / 1000)) : 0;
+    this.statusTextEl.textContent = sec > 0 ? `${base}（已等待 ${sec}s）` : base;
+  }
+
+  private stopStatusTicker() {
+    if (this.statusTimer != null) {
+      try {
+        window.clearInterval(this.statusTimer);
+      } catch (_) {}
+      this.statusTimer = null;
+    }
+    this.statusStartedAt = 0;
+  }
+
+  private startStatusTicker(baseText: string) {
+    this.stopStatusTicker();
+    this.statusStartedAt = Date.now();
+    this.statusBaseText = String(baseText || '');
+    if (this.statusEl) this.statusEl.style.display = 'flex';
+    this.updateStatusText();
+    this.statusTimer = window.setInterval(() => this.updateStatusText(), 1000);
+  }
+
   private async refreshNativeViewer(): Promise<boolean> {
     if (!this.mountEl) return false;
     try {
 
     const moduleUrl = this.data.moduleUrl || toModuleUrl(this.data.viewerHostUrl);
     try {
+      this.showStatus('正在初始化组件…');
       await ensureEcadModule(moduleUrl);
     } catch (err) {
       this.mountEl.innerHTML = '';
+      if (this.statusEl) this.mountEl.appendChild(this.statusEl);
       this.setHint(`加载 ecad-viewer 失败: ${String(err)}`);
+      this.stopStatusTicker();
+      this.showStatus(`加载失败：${String(err)}`);
       return false;
     }
 
@@ -377,10 +503,12 @@ export default class EcadViewerTool implements BlockTool {
     const height = this.config.iframeHeight || 560;
 
     this.mountEl.innerHTML = '';
+    if (this.statusEl) this.mountEl.appendChild(this.statusEl);
     this.currentViewerEl = undefined;
 
     let viewer: HTMLElement;
     try {
+      this.showStatus('正在创建视图…');
       // 强制显示顶部标签栏：
       // ecad-viewer 内部使用 `if (window.hide_header)` 来隐藏头部；
       // 而 load_ecad_viewer_conf 会把 URL 参数 hide-header 写到 window.hide_header（字符串 "false" 也会被当成 truthy）。
@@ -400,7 +528,10 @@ export default class EcadViewerTool implements BlockTool {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.mountEl.innerHTML = '';
+      if (this.statusEl) this.mountEl.appendChild(this.statusEl);
       this.setHint(`创建 viewer 失败：${msg}`);
+      this.stopStatusTicker();
+      this.showStatus(`加载失败：${msg}`);
       return false;
     }
 
@@ -420,7 +551,10 @@ export default class EcadViewerTool implements BlockTool {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.mountEl.innerHTML = '';
+      if (this.statusEl) this.mountEl.appendChild(this.statusEl);
       this.setHint(`创建 source 节点失败：${msg}`);
+      this.stopStatusTicker();
+      this.showStatus(`加载失败：${msg}`);
       return false;
     }
 
@@ -429,6 +563,26 @@ export default class EcadViewerTool implements BlockTool {
     // 强制触发一次加载（避免某些情况下 initialContentCallback 未触发导致空白）
     try {
       const anyViewer = viewer as any;
+
+      // 监听 ecad-viewer 内部的加载状态事件（若存在），用于细粒度状态文案
+      try {
+        this.statusAbort?.abort();
+      } catch (_) {}
+      this.statusAbort = new AbortController();
+      try {
+        (viewer as any).addEventListener?.(
+          'ecad-viewer:loading-status',
+          (ev: any) => {
+            const msg = ev?.detail?.message || ev?.detail?.text || '';
+            if (!msg) return;
+            this.statusBaseText = String(msg);
+            this.updateStatusText();
+            this.setHint(String(msg));
+          },
+          { signal: this.statusAbort.signal } as any,
+        );
+      } catch (_) {}
+
       // 等一帧，确保自定义元素已连接并完成首次渲染（否则某些内部字段可能尚未就绪，表现为一直“加载中”）
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       if (anyViewer && anyViewer.updateComplete && typeof anyViewer.updateComplete.then === 'function') {
@@ -438,11 +592,14 @@ export default class EcadViewerTool implements BlockTool {
 
       // 资源探测：避免上传后 url 指向 404/HTML，导致内部加载卡住但无明显错误
       if (sources.length >= 1) {
+        this.showStatus('正在校验资源…');
         const probeUrl = sources[0]!;
         const probe = await fetchRangePrefix(probeUrl, 80);
         const ascii = u8ToAscii(probe.prefix).trim();
         if (!probe.ok) {
           this.setHint(`加载失败：资源不可访问（${probe.status}）`);
+          this.stopStatusTicker();
+          this.showStatus(`加载失败：资源不可访问（${probe.status}）`);
           return false;
         }
         if (zipOnly) {
@@ -451,6 +608,8 @@ export default class EcadViewerTool implements BlockTool {
             // 常见：返回了 HTML（如登录页/错误页）
             const preview = ascii.slice(0, 24).replace(/\s+/g, ' ');
             this.setHint(`加载失败：不是 ZIP 内容（${probe.contentType || 'unknown'}，前缀="${preview}"）`);
+            this.stopStatusTicker();
+            this.showStatus(`加载失败：不是 ZIP 内容（${probe.contentType || 'unknown'}）`);
             return false;
           }
         } else {
@@ -458,6 +617,8 @@ export default class EcadViewerTool implements BlockTool {
           if (ascii.toLowerCase().startsWith('<!doctype') || ascii.toLowerCase().startsWith('<html')) {
             const preview = ascii.slice(0, 24).replace(/\s+/g, ' ');
             this.setHint(`加载失败：返回了 HTML（${probe.contentType || 'unknown'}，前缀="${preview}"）`);
+            this.stopStatusTicker();
+            this.showStatus(`加载失败：返回了 HTML（${probe.contentType || 'unknown'}）`);
             return false;
           }
         }
@@ -466,12 +627,14 @@ export default class EcadViewerTool implements BlockTool {
       const loadPromise = (async () => {
         if (zipOnly && sources[0] && typeof anyViewer.load_window_zip_url === 'function') {
           this.setHint(`正在加载：${basenameFromUrl(sources[0])}`);
+          this.startStatusTicker('正在加载工程…');
           await anyViewer.load_window_zip_url(sources[0]);
           return;
         }
         if (typeof anyViewer.load_src === 'function') {
           if (sources.length === 1) this.setHint(`正在加载：${basenameFromUrl(sources[0])}`);
           else if (sources.length > 1) this.setHint(`正在加载：${sources.length} 个文件`);
+          this.startStatusTicker('正在加载工程…');
           await anyViewer.load_src();
         }
       })();
@@ -485,6 +648,7 @@ export default class EcadViewerTool implements BlockTool {
           throw new Error(`加载超时（${Math.round(timeoutMs / 1000)}s）`);
         })(),
       ]);
+      this.stopStatusTicker();
 
       // 恢复已保存的 viewer UI 状态（例如层可见性/透明度等）。
       // 注意：这里先回放状态，再绑定事件监听，避免“初始化回放”把 block 标记为已修改。
@@ -516,6 +680,8 @@ export default class EcadViewerTool implements BlockTool {
       console.warn('[ECAD] viewer load failed:', e);
       const msg = e instanceof Error ? e.message : String(e);
       this.setHint(`加载失败：${msg}`);
+      this.stopStatusTicker();
+      this.showStatus(`加载失败：${msg}`);
       return false;
     }
 
@@ -537,10 +703,14 @@ export default class EcadViewerTool implements BlockTool {
       }
     }
 
+    this.stopStatusTicker();
+    this.hideStatus();
     return true;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.setHint(`加载失败：${msg}`);
+      this.stopStatusTicker();
+      this.showStatus(`加载失败：${msg}`);
       return false;
     }
   }
