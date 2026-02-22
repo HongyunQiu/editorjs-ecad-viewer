@@ -24,10 +24,18 @@ export class Disposables implements IDisposable {
     private _is_disposed: boolean = false;
 
     public add<T extends IDisposable>(item: T): T {
+        // 兼容历史调用中把 void/undefined 传进来的情况
+        if (!item || typeof (item as any).dispose !== "function") {
+            return item;
+        }
         if (this._is_disposed) {
-            throw new Error(
-                "Tried to add item to a DisposableStack that's already been disposed",
-            );
+            // 处于销毁态时，不再抛错中断主流程，直接释放新增资源
+            try {
+                item.dispose();
+            } catch (e) {
+                console.warn("Error disposing late-added resource", e);
+            }
+            return item;
         }
         this._disposables.add(item);
 
@@ -53,7 +61,13 @@ export class Disposables implements IDisposable {
             return;
         }
         for (const item of this._disposables.values()) {
-            item.dispose();
+            try {
+                if (item && typeof (item as any).dispose === "function") {
+                    item.dispose();
+                }
+            } catch (e) {
+                console.warn("Error disposing resource", e);
+            }
         }
         this._disposables.clear();
         this._is_disposed = true;

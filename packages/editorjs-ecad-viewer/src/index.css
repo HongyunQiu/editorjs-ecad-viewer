@@ -40,6 +40,11 @@
   background: #f8fafc;
 }
 
+.cdx-ecad-viewer__preview.is-collapsed {
+  min-height: 0;
+  background: #fff;
+}
+
 .cdx-ecad-viewer__status {
   position: absolute;
   inset: 0;

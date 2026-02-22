@@ -60,6 +60,8 @@ export type EcadViewerPcbObjectsViewState = {
 export type EcadViewerViewState = {
     /** 当前激活页签（pcb/sch/bom/step） */
     activeTab?: TabKind;
+    /** 是否折叠显示区域（仅显示顶部菜单条） */
+    collapsed?: boolean;
     pcb?: {
         /** PCB 图层可见性快照 */
         layers?: Record<string, boolean>;
@@ -82,6 +84,8 @@ function cloneViewState(v: EcadViewerViewState): EcadViewerViewState {
     } catch (_) {}
     return JSON.parse(JSON.stringify(v || {}));
 }
+
+type EcadViewerViewStateOrigin = "user" | "restore";
 
 export class ECadViewer extends KCUIElement implements InputContainer {
     static override styles = [
@@ -204,6 +208,7 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     public get target() {
         return this;
     }
+    public on_open_file?: () => void;
 
     #tab_contents: Record<string, HTMLElement> = {};
     #active_tab: TabKind = TabKind.pcb;
@@ -218,7 +223,15 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     #content: HTMLElement;
     #step_viewer_placeholder: HTMLElement;
     #viewers_container: HTMLDivElement;
+    #is_viewer_collapsed = false;
     #is_full_screen = false;
+    #expanded_host_height_style: string | null = null;
+    #expanded_host_aspect_ratio_style: string | null = null;
+    #deferred_load:
+        | { kind: "src" }
+        | { kind: "zipUrl"; url: string }
+        | { kind: "zipBlob"; file: Blob; filename: string }
+        | null = null;
     #fullscreen_prev_body_overflow: string | null = null;
     #fullscreen_keydown_handler: ((e: KeyboardEvent) => void) | null = null;
     #fullscreen_overlay: HTMLDivElement | null = null;
@@ -227,6 +240,12 @@ export class ECadViewer extends KCUIElement implements InputContainer {
 
     // 记录当前 viewer 最近一次成功加载的 sources（用于全屏克隆快速复现内容，尤其是 ZIP/load_zip 路径）
     #last_sources: EcadSources | null = null;
+    // 由外层工具注入的“下载 URL -> 原始文件名”映射（用于下载时保留原始文件名）
+    #source_name_map: Record<string, string> = {};
+    // 外层工具注入的“本次上传主文件原始名”兜底
+    #preferred_original_filename = "";
+    #last_download_target: { filename: string; url?: string; blob?: Blob } | null =
+        null;
 
     #loading_status_text = "";
 
@@ -394,12 +413,295 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         return cloneViewState(this.#view_state);
     }
 
+    public isPageFullscreenActive(): boolean {
+        return this.#is_full_screen || !!this.#fullscreen_original;
+    }
+
+    public setViewerCollapsed(
+        collapsed: boolean,
+        origin: EcadViewerViewStateOrigin = "user",
+    ): void {
+        // 全屏模式下禁用折叠能力
+        if (this.isPageFullscreenActive()) return;
+        const next = !!collapsed;
+        const prev = this.#is_viewer_collapsed;
+        this.#is_viewer_collapsed = next;
+        if (this.#viewers_container) {
+            this.#viewers_container.style.display = this.#is_viewer_collapsed
+                ? "none"
+                : "";
+        }
+
+        // 未加载时，直接同步切换 spinner 可见性（折叠隐藏、展开显示），
+        // 并触发一次 update() 重新渲染（正确显示/隐藏 header 和 spinner）。
+        // 已加载时不能调 update()——会重建子组件（kc-board-app 等）并丢失状态。
+        if (!this.loaded) {
+            try {
+                if (this.#spinner) {
+                    this.#spinner.hidden = next;
+                }
+            } catch (_) {}
+            try {
+                void this.update();
+            } catch (_) {}
+        }
+
+        // 折叠时将宿主元素高度收紧到仅菜单条，展开时恢复原高度
+        try {
+            if (this.#is_viewer_collapsed) {
+                // 记录“展开态”的 inline 样式，以便恢复
+                this.#expanded_host_height_style = this.style.height || "";
+                this.#expanded_host_aspect_ratio_style =
+                    (this.style as any).aspectRatio || "";
+
+                const cs = window.getComputedStyle(this);
+                const headerSize =
+                    (cs.getPropertyValue("--header-bar-size") || "").trim() ||
+                    "32px";
+                this.style.height = headerSize;
+                (this.style as any).aspectRatio = "auto";
+                this.style.overflow = "hidden";
+            } else {
+                if (this.#expanded_host_height_style) {
+                    this.style.height = this.#expanded_host_height_style;
+                } else {
+                    this.style.removeProperty("height");
+                }
+
+                if (this.#expanded_host_aspect_ratio_style) {
+                    (this.style as any).aspectRatio =
+                        this.#expanded_host_aspect_ratio_style;
+                } else {
+                    this.style.removeProperty("aspect-ratio");
+                }
+                this.style.removeProperty("overflow");
+
+                // 若之前由于折叠而延迟了加载，则在展开时触发加载
+                if (prev && !this.#is_viewer_collapsed) {
+                    void this.#run_deferred_load_if_needed();
+                }
+            }
+        } catch (_) {}
+
+        // 记录并上报折叠状态，供外部持久化
+        try {
+            this.#merge_view_state({ collapsed: this.#is_viewer_collapsed });
+            this.#emit_view_state_change(origin);
+        } catch (_) {}
+    }
+
+    public toggleViewerCollapsed(): boolean {
+        this.setViewerCollapsed(!this.#is_viewer_collapsed, "user");
+        return this.#is_viewer_collapsed;
+    }
+
+    public getViewerCollapsed(): boolean {
+        return this.#is_viewer_collapsed;
+    }
+
+    async #run_deferred_load_if_needed(): Promise<void> {
+        if (this.#is_viewer_collapsed) return;
+        if (this.loading) return;
+        if (this.loaded) {
+            this.#deferred_load = null;
+            return;
+        }
+        const d = this.#deferred_load;
+        if (!d) return;
+        this.#deferred_load = null;
+        try {
+            if (d.kind === "zipUrl") {
+                await this.load_window_zip_url(d.url);
+                return;
+            }
+            if (d.kind === "zipBlob") {
+                await this.load_zip(d.file, d.filename);
+                return;
+            }
+            await this.load_src();
+        } catch (e) {
+            console.warn("[ECAD] deferred load failed:", e);
+        }
+    }
+
+    #normalize_url_key(url: string): string {
+        try {
+            const u = new URL(url, window.location.href);
+            u.hash = "";
+            // query 变化不应影响同一文件名映射
+            u.search = "";
+            return u.toString();
+        } catch (_) {
+            return String(url || "").split("#")[0]!.split("?")[0]!;
+        }
+    }
+
+    public setSourceNameMap(nameMap: Record<string, string> | null | undefined) {
+        const next: Record<string, string> = {};
+        for (const [k, v] of Object.entries(nameMap || {})) {
+            next[this.#normalize_url_key(k)] = String(v || "");
+        }
+        this.#source_name_map = next;
+        try {
+            console.info("[ECAD-INNER] setSourceNameMap =", this.#source_name_map);
+        } catch (_) {}
+        // 若当前已有下载目标，按“首选原始名 -> 映射 -> URL basename”统一重算
+        if (this.#last_download_target?.url) {
+            this.#last_download_target = {
+                ...this.#last_download_target,
+                filename: this.#resolve_filename_for_url(
+                    this.#last_download_target.url,
+                    this.#last_download_target.filename || "download",
+                ),
+            };
+        }
+        this.#emit_file_meta_change();
+    }
+
+    public setPreferredOriginalFilename(filename: string | null | undefined) {
+        this.#preferred_original_filename = String(filename || "").trim();
+        try {
+            console.info(
+                "[ECAD-INNER] setPreferredOriginalFilename =",
+                this.#preferred_original_filename,
+            );
+        } catch (_) {}
+        if (this.#last_download_target?.url) {
+            const resolved = this.#resolve_filename_for_url(
+                this.#last_download_target.url,
+                this.#last_download_target.filename || "download",
+            );
+            this.#last_download_target = {
+                ...this.#last_download_target,
+                filename: resolved,
+            };
+        } else if (this.#last_download_target && this.#preferred_original_filename) {
+            // 无 URL（例如 blob 下载）时也优先展示/下载原始文件名
+            this.#last_download_target = {
+                ...this.#last_download_target,
+                filename: this.#preferred_original_filename,
+            };
+        }
+        this.#emit_file_meta_change();
+    }
+
+    public getDisplayFileName(): string {
+        if (this.#last_download_target?.filename) {
+            return this.#last_download_target.filename;
+        }
+        if (this.#preferred_original_filename) {
+            return this.#preferred_original_filename;
+        }
+        for (const v of Object.values(this.#source_name_map)) {
+            if (v) return v;
+        }
+        return "";
+    }
+
+    #emit_file_meta_change() {
+        try {
+            console.info("[ECAD-INNER] displayFileName =", this.getDisplayFileName());
+        } catch (_) {}
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:file-meta-change", {
+                    detail: {
+                        displayFileName: this.getDisplayFileName(),
+                    },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        } catch (_) {}
+    }
+
+    #basename_from_url(url: string): string {
+        try {
+            const u = new URL(url, window.location.href);
+            const parts = (u.pathname || "").split("/").filter(Boolean);
+            return parts.length
+                ? decodeURIComponent(parts[parts.length - 1]!)
+                : "download";
+        } catch (_) {
+            const parts = String(url || "").split("/").filter(Boolean);
+            return parts.length ? parts[parts.length - 1]! : "download";
+        }
+    }
+
+    #trigger_download(target: { filename: string; url?: string; blob?: Blob }) {
+        const link = document.createElement("a");
+        link.style.display = "none";
+        let object_url: string | null = null;
+        if (target.blob) {
+            object_url = URL.createObjectURL(target.blob);
+            link.href = object_url;
+        } else if (target.url) {
+            link.href = target.url;
+        } else {
+            return;
+        }
+        link.download = target.filename || "download";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        if (object_url) {
+            setTimeout(() => {
+                try {
+                    URL.revokeObjectURL(object_url!);
+                } catch (_) {}
+            }, 2000);
+        }
+    }
+
+    public downloadCurrentFile(): boolean {
+        if (!this.#last_download_target) return false;
+        this.#trigger_download(this.#last_download_target);
+        return true;
+    }
+
+    #resolve_filename_for_url(url: string, fallback = "download"): string {
+        if (this.#preferred_original_filename) {
+            try {
+                console.info(
+                    "[ECAD-INNER] resolve filename by preferred",
+                    this.#preferred_original_filename,
+                    "url=",
+                    url,
+                );
+            } catch (_) {}
+            return this.#preferred_original_filename;
+        }
+        const mapped = this.#source_name_map[this.#normalize_url_key(url)];
+        if (mapped) {
+            try {
+                console.info("[ECAD-INNER] resolve filename by map", mapped, "url=", url);
+            } catch (_) {}
+            return mapped;
+        }
+        try {
+            console.info(
+                "[ECAD-INNER] resolve filename by basename",
+                this.#basename_from_url(url) || fallback,
+                "url=",
+                url,
+            );
+        } catch (_) {}
+        return this.#basename_from_url(url) || fallback;
+    }
+
     /**
      * 外部设置/恢复 viewer 的 UI 状态。
      * - 可在 loaded=false 时调用，内部会延迟到加载完成后再应用
      */
     public async setViewState(state: Partial<EcadViewerViewState>): Promise<void> {
         if (!state || typeof state !== "object") return;
+
+        // collapsed 不依赖 loaded，可优先应用，确保“初始折叠”时不触发加载
+        try {
+            if (Object.prototype.hasOwnProperty.call(state as any, "collapsed")) {
+                this.setViewerCollapsed(!!(state as any).collapsed, "restore");
+            }
+        } catch (_) {}
 
         this.#merge_view_state(state);
 
@@ -425,6 +727,9 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     #merge_view_state(fragment: Partial<EcadViewerViewState>) {
         const next = cloneViewState(this.#view_state || {});
         if (fragment.activeTab) next.activeTab = fragment.activeTab;
+        if (Object.prototype.hasOwnProperty.call(fragment as any, "collapsed")) {
+            next.collapsed = !!(fragment as any).collapsed;
+        }
 
         if (fragment.pcb) {
             next.pcb = next.pcb || {};
@@ -442,11 +747,11 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         this.#view_state = next;
     }
 
-    #emit_view_state_change() {
+    #emit_view_state_change(origin: EcadViewerViewStateOrigin = "user") {
         try {
             this.dispatchEvent(
                 new CustomEvent("ecad-viewer:view-state-change", {
-                    detail: { viewState: this.getViewState() },
+                    detail: { viewState: this.getViewState(), origin },
                     bubbles: true,
                     composed: true,
                 }),
@@ -487,6 +792,13 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         // 本项目的 render() 会创建新的子组件（例如 kc-board-app），
         // 若在“已加载并已显示内容”后触发 update()，会导致子组件被重建，
         // 从而错过 project.on_loaded() 已经派发过的 change 事件，最终卡在 spinner。
+
+        // Collapse（不依赖 loaded，可直接应用）
+        if (Object.prototype.hasOwnProperty.call(fragment as any, "collapsed")) {
+            try {
+                this.setViewerCollapsed(!!(fragment as any).collapsed, "restore");
+            } catch (_) {}
+        }
 
         // Tab
         if (fragment.activeTab && this.#tab_header) {
@@ -659,7 +971,7 @@ export class ECadViewer extends KCUIElement implements InputContainer {
             complete = false;
         }
 
-        this.#emit_view_state_change();
+        this.#emit_view_state_change("restore");
         return complete;
     }
 
@@ -699,6 +1011,15 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                 void this.#setup_project(sources);
                 return;
             }
+
+            // 默认行为：自动根据 DOM 内 <ecad-source>/<ecad-blob> 触发加载。
+            // 但某些集成（如 Editor.js 外层工具）会希望由外部统一控制加载时机（例如折叠态不触发网络请求），
+            // 此时可设置属性 auto-load="false" 禁用这里的自动加载。
+            try {
+                const autoLoadAttr = (this.getAttribute("auto-load") || "").trim().toLowerCase();
+                const autoLoad = autoLoadAttr !== "false";
+                if (!autoLoad) return;
+            } catch (_) {}
 
             this.load_src();
         });
@@ -754,7 +1075,16 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         );
     }
 
-    async load_zip(file: Blob) {
+    async load_zip(file: Blob, filename = "project.zip") {
+        if (this.getViewerCollapsed()) {
+            this.#deferred_load = { kind: "zipBlob", file, filename };
+            // 折叠态也更新“文件元信息”，便于 header 展示/下载
+            this.#last_download_target = { filename, blob: file };
+            this.#emit_file_meta_change();
+            return;
+        }
+        this.#last_download_target = { filename, blob: file };
+        this.#emit_file_meta_change();
         try {
             this.dispatchEvent(
                 new CustomEvent("ecad-viewer:loading-status", {
@@ -825,6 +1155,20 @@ export class ECadViewer extends KCUIElement implements InputContainer {
     }
 
     async load_window_zip_url(url: string) {
+        if (this.getViewerCollapsed()) {
+            this.#deferred_load = { kind: "zipUrl", url };
+            this.#last_download_target = {
+                filename: this.#resolve_filename_for_url(url, "project.zip"),
+                url,
+            };
+            this.#emit_file_meta_change();
+            return;
+        }
+        this.#last_download_target = {
+            filename: this.#resolve_filename_for_url(url, "project.zip"),
+            url,
+        };
+        this.#emit_file_meta_change();
         try {
             this.dispatchEvent(
                 new CustomEvent("ecad-viewer:loading-status", {
@@ -841,10 +1185,18 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                 }),
             );
         } catch (_) {}
-        return this.load_zip(blob);
+        return this.load_zip(
+            blob,
+            this.#resolve_filename_for_url(url, "project.zip"),
+        );
     }
 
     async load_src() {
+        if (this.getViewerCollapsed()) {
+            // 若已有更具体的 deferred（zipUrl/zipBlob），不要覆盖
+            if (!this.#deferred_load) this.#deferred_load = { kind: "src" };
+            return;
+        }
         if (window.zip_url) {
             return this.load_window_zip_url(window.zip_url);
         }
@@ -907,6 +1259,20 @@ export class ECadViewer extends KCUIElement implements InputContainer {
                 this.#project.ov_3d_url = src.src;
                 break;
             }
+        }
+
+        const zip_url = urls.find((u) => u.toLowerCase().endsWith(".zip"));
+        const target_url = zip_url ?? (urls.length === 1 ? urls[0] : undefined);
+        if (target_url) {
+            this.#last_download_target = {
+                filename: this.#resolve_filename_for_url(target_url),
+                url: target_url,
+            };
+            this.#emit_file_meta_change();
+        } else if (!zip_url && urls.length > 1) {
+            // 多文件且非 ZIP 时，不做“单文件下载”假设，避免下载错误文件
+            this.#last_download_target = null;
+            this.#emit_file_meta_change();
         }
 
         await this.#setup_project({ urls, blobs });
@@ -1130,6 +1496,15 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         this.style.pointerEvents = "";
 
         this.#is_full_screen = false;
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:fullscreen-change", {
+                    detail: { active: false },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        } catch (_) {}
 
         later(() => {
             window.dispatchEvent(new Event("resize"));
@@ -1214,6 +1589,15 @@ export class ECadViewer extends KCUIElement implements InputContainer {
 
         this.#fullscreen_overlay = overlay;
         this.#is_full_screen = true;
+        try {
+            this.dispatchEvent(
+                new CustomEvent("ecad-viewer:fullscreen-change", {
+                    detail: { active: true },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        } catch (_) {}
 
         later(() => {
             window.dispatchEvent(new Event("resize"));
@@ -1250,7 +1634,32 @@ export class ECadViewer extends KCUIElement implements InputContainer {
         try {
             (this.#spinner as any).text = this.#loading_status_text || "";
         } catch (_) {}
-        if (!this.loaded) return this.#spinner;
+        if (!this.loaded) {
+            // 折叠态下，不应因为“尚未加载”而一直显示转圈 spinner；
+            // 这里改为优先渲染顶部 header（含折叠/展开按钮），仅在展开态才显示 spinner。
+            if (this.#is_viewer_collapsed) {
+                try {
+                    this.#spinner.hidden = true;
+                } catch (_) {}
+                try {
+                    this.#tab_header = new TabHeaderElement({
+                        has_3d: false,
+                        has_pcb: false,
+                        sch_count: 0,
+                        has_bom: false,
+                    });
+                    if (window.hide_header) {
+                        this.#tab_header.hidden = true;
+                    }
+                    this.#tab_header.input_container = this;
+                } catch (_) {}
+                this.#content = html` <div class="vertical">
+                    ${this.#tab_header}
+                </div>` as HTMLElement;
+                return html` ${this.#content} ${this.#spinner} `;
+            }
+            return this.#spinner;
+        }
         this.#spinner.hidden = true;
         this.#tab_contents = {};
 
@@ -1400,6 +1809,9 @@ export class ECadViewer extends KCUIElement implements InputContainer {
             ${this.#board_app} ${this.#schematic_app} ${this.#bom_app}
             ${this.#step_viewer_placeholder}
         </div>` as HTMLDivElement;
+        if (this.#is_viewer_collapsed) {
+            this.#viewers_container.style.display = "none";
+        }
 
         this.#content = html` <div class="vertical">
             ${this.#tab_header} ${this.#viewers_container}

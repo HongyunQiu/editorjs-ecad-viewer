@@ -16,26 +16,59 @@ export interface TabData {
     content: HTMLElement;
 }
 
-export const is_ad = (name: string) =>
-    name.endsWith(".SchDoc") || name.endsWith(".PcbDoc");
+export const is_ad = (name: string) => {
+    const n = String(name || "").toLowerCase();
+    return n.endsWith(".schdoc") || n.endsWith(".pcbdoc");
+};
 
-export const is_kicad = (name: string) =>
-    name.endsWith(".kicad_pcb") ||
-    name.endsWith(".kicad_sch") ||
-    name.endsWith(".kicad_pro");
+export const is_kicad = (name: string) => {
+    const n = String(name || "").toLowerCase();
+    return (
+        n.endsWith(".kicad_pcb") ||
+        n.endsWith(".kicad_sch") ||
+        n.endsWith(".kicad_pro")
+    );
+};
 
-export const is_3d_model = (name: string) => name.endsWith(".glb");
+export const is_3d_model = (name: string) =>
+    String(name || "").toLowerCase().endsWith(".glb");
 
 export class TabHeaderElement extends KCUIElement {
     #elements: Map<Sections, Map<TabKind, HTMLElement>>;
     #current_tab?: TabKind;
     #input_container: InputContainer;
+    #collapse_btn?: HTMLElement;
+    #file_name_label?: HTMLSpanElement;
 
-    #open_file_btn = html`<tab-button
-        icon="svg:open_file"
-        class="end"
-        title="Open local file">
-    </tab-button>` as HTMLElement;
+    #sync_collapse_button_state() {
+        const btn = this.#collapse_btn as any;
+        if (!btn) return;
+        const target = this.#input_container?.target as any;
+        const in_fullscreen =
+            !!target?.isPageFullscreenActive?.() || false;
+        btn.disabled = in_fullscreen;
+    }
+
+    #sync_collapse_button_icon() {
+        const btn = this.#collapse_btn as any;
+        if (!btn) return;
+        const target = this.#input_container?.target as any;
+        const collapsed = !!target?.getViewerCollapsed?.();
+        btn.icon = collapsed ? "svg:visibility_off" : "svg:visibility";
+        btn.title = collapsed ? "Expand display area" : "Collapse display area";
+    }
+
+    #sync_file_name_label() {
+        if (!this.#file_name_label) return;
+        const target = this.#input_container?.target as any;
+        const filename = String(target?.getDisplayFileName?.() || "").trim();
+        try {
+            console.info("[ECAD-HEADER] sync file name label =", filename);
+        } catch (_) {}
+        this.#file_name_label.textContent = filename || "";
+        this.#file_name_label.title = filename || "";
+        this.#file_name_label.style.display = filename ? "inline-block" : "none";
+    }
 
     public constructor(
         public option: {
@@ -93,6 +126,17 @@ export class TabHeaderElement extends KCUIElement {
             .end {
                 justify-content: right;
             }
+            .file-name-label {
+                max-width: 260px;
+                margin-right: 8px;
+                color: var(--tab-button-color);
+                opacity: 0.9;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                font-size: 12px;
+                line-height: 1;
+            }
             .menu {
                 display: none;
             }
@@ -125,7 +169,11 @@ export class TabHeaderElement extends KCUIElement {
 
     make_ecad_view = () => html`<ecad-viewer> </ecad-viewer>`;
 
-    async load_zip_content(input_container: InputContainer, file: Blob) {
+    async load_zip_content(
+        input_container: InputContainer,
+        file: Blob,
+        filename?: string,
+    ) {
         const parent = input_container.target.parentElement;
         if (!parent) throw new Error("Parent element not found");
 
@@ -142,16 +190,29 @@ export class TabHeaderElement extends KCUIElement {
             this.dispatchEvent(new OpenBarrierEvent());
             await this.uploadDesignFiles(designFilesToConvert, input_container);
         } else {
+            const viewer_target = input_container.target as any;
+            if (viewer_target?.load_zip && file) {
+                await viewer_target.load_zip(file, filename || "project.zip");
+                return;
+            }
             await this.readAndDisplayFiles(files, input_container);
         }
     }
 
     public set input_container(input_container: InputContainer) {
-        this.#open_file_btn.addEventListener("click", () => {
-            input_container.input.click();
-        });
-
         this.#input_container = input_container;
+        input_container.input.accept =
+            ".zip,.kicad_sch,.kicad_pcb,.kicad_pro,.glb,.SchDoc,.PcbDoc,.schdoc,.pcbdoc";
+        input_container.target.addEventListener(
+            "ecad-viewer:fullscreen-change",
+            () => {
+                this.#sync_collapse_button_state();
+                this.#sync_collapse_button_icon();
+            },
+        );
+        input_container.target.addEventListener("ecad-viewer:file-meta-change", () => {
+            this.#sync_file_name_label();
+        });
 
         input_container.input.addEventListener("change", async (e) => {
             const files = (e.target as HTMLInputElement).files;
@@ -161,7 +222,8 @@ export class TabHeaderElement extends KCUIElement {
             const zipFiles: File[] = [];
 
             Array.from(files).forEach((file) => {
-                if (file.name.endsWith(".zip")) {
+                const file_name = String(file.name || "").toLowerCase();
+                if (file_name.endsWith(".zip")) {
                     zipFiles.push(file);
                 } else if (is_ad(file.name)) {
                     designFilesToConvert.push(file);
@@ -169,7 +231,11 @@ export class TabHeaderElement extends KCUIElement {
             });
 
             if (zipFiles.length)
-                return this.load_zip_content(input_container, zipFiles[0]!);
+                return this.load_zip_content(
+                    input_container,
+                    zipFiles[0]!,
+                    zipFiles[0]!.name,
+                );
 
             if (designFilesToConvert.length && window.cli_server_addr) {
                 this.dispatchEvent(new OpenBarrierEvent());
@@ -330,12 +396,57 @@ export class TabHeaderElement extends KCUIElement {
                 break;
             case Sections.end:
                 {
+                    this.#file_name_label = document.createElement("span");
+                    this.#file_name_label.classList.add("file-name-label");
+                    this.#file_name_label.style.display = "none";
+                    section.appendChild(this.#file_name_label);
+
+                    const open_file = html`<tab-button
+                        title="Open file"
+                        icon="svg:open_file"
+                        class="end"></tab-button>` as HTMLElement;
+                    open_file.addEventListener("click", () => {
+                        if (this.#input_container.on_open_file) {
+                            this.#input_container.on_open_file();
+                            return;
+                        }
+                        this.#input_container.input.click();
+                    });
+                    section.appendChild(open_file);
+
+                    const download = html`<tab-button
+                        title="Download file"
+                        icon="svg:download"
+                        class="end"></tab-button>` as HTMLElement;
+                    download.addEventListener("click", () => {
+                        const target = this.#input_container.target as any;
+                        target?.downloadCurrentFile?.();
+                    });
+                    section.appendChild(download);
+
+                    const collapse_btn = html`<tab-button
+                        title="Collapse display area"
+                        icon="svg:visibility"
+                        class="end"></tab-button>` as HTMLElement;
+                    collapse_btn.addEventListener("click", () => {
+                        const target = this.#input_container.target as any;
+                        if (target?.isPageFullscreenActive?.()) return;
+                        target?.toggleViewerCollapsed?.();
+                        this.#sync_collapse_button_icon();
+                    });
+                    this.#collapse_btn = collapse_btn;
+                    section.appendChild(collapse_btn);
+
                     const full_screen = html`<tab-button
                         title="Switch full screen mode"
                         icon="svg:full_screen"
                         class="end"></tab-button>` as HTMLElement;
                     full_screen.addEventListener("click", () => {
                         this.#input_container.on_full_windows();
+                        window.setTimeout(() => {
+                            this.#sync_collapse_button_state();
+                            this.#sync_collapse_button_icon();
+                        }, 0);
                     });
                     section.appendChild(full_screen);
                 }
@@ -346,6 +457,9 @@ export class TabHeaderElement extends KCUIElement {
     }
 
     override renderedCallback(): void | undefined {
+        this.#sync_collapse_button_state();
+        this.#sync_collapse_button_icon();
+        this.#sync_file_name_label();
         if (!window.app || window.app === "full") {
             if (window.default_page) {
                 this.activateTab(window.default_page.toUpperCase() as TabKind);

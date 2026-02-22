@@ -65,8 +65,8 @@ export class TabButtonElement extends KCUIElement {
     @query("button", true)
     private button!: HTMLButtonElement;
 
-    @query("button_icon", true)
-    private button_icon!: KCUIIconElement;
+    @query("kc-ui-icon", true)
+    private button_icon?: KCUIIconElement;
 
     @attribute({ type: String })
     name: string | null;
@@ -100,7 +100,12 @@ export class TabButtonElement extends KCUIElement {
                 this.button.disabled = value == null ? false : true;
                 break;
             case "icon":
-                this.button_icon.innerText = value ?? "";
+                if (this.button_icon) {
+                    this.button_icon.innerText = value ?? "";
+                } else {
+                    // 若 icon 元素尚未渲染，触发一次更新以重新挂载图标节点
+                    void this.update();
+                }
                 break;
         }
     }
@@ -111,6 +116,9 @@ export class TabButtonElement extends KCUIElement {
         }
 
         this.button.disabled = this.disabled;
+        if (this.button_icon) {
+            this.button_icon.innerText = this.icon ?? "";
+        }
     }
 
     override render() {

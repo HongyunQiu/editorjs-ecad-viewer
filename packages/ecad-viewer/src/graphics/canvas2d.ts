@@ -9,6 +9,8 @@ import { Angle, BBox, Matrix3, Vec2 } from "../base/math";
 import { Renderer, RenderLayer, RenderStateStack } from "./renderer";
 import { Arc, Circle, Polygon, Polyline } from "./shapes";
 
+const warnedNoCtxRenderers = new WeakSet<Canvas2DRenderer>();
+
 /**
  * Canvas2d-based renderer.
  *
@@ -120,15 +122,18 @@ export class Canvas2DRenderer extends Renderer {
     }
 
     override clear_canvas() {
+        if (!this.ctx2d || !this.canvas) {
+            return;
+        }
         this.update_canvas_size();
 
-        this.ctx2d!.setTransform();
+        this.ctx2d.setTransform();
         // this.ctx2d!.scale(window.devicePixelRatio, window.devicePixelRatio);
 
-        this.ctx2d!.fillStyle = this.background_color.to_css();
-        this.ctx2d!.fillRect(0, 0, this.canvas.width, this.canvas.height);
-        this.ctx2d!.lineCap = "round";
-        this.ctx2d!.lineJoin = "round";
+        this.ctx2d.fillStyle = this.background_color.to_css();
+        this.ctx2d.fillRect(0, 0, this.canvas.width, this.canvas.height);
+        this.ctx2d.lineCap = "round";
+        this.ctx2d.lineJoin = "round";
     }
 
     override start_layer(name: string) {
@@ -335,7 +340,18 @@ class Canvas2dRenderLayer extends RenderLayer {
         const ctx = (this.renderer as Canvas2DRenderer).ctx2d;
 
         if (!ctx) {
-            throw new Error("No CanvasRenderingContext2D!");
+            // 在某些生命周期边界（例如 canvas 被移除/销毁但 rAF 还在跑）ctx2d 会暂时不可用。
+            // 这类情况不应抛 uncaught 异常污染控制台；跳过该帧即可。
+            const r = this.renderer as Canvas2DRenderer;
+            if (!warnedNoCtxRenderers.has(r)) {
+                warnedNoCtxRenderers.add(r);
+                try {
+                    console.warn(
+                        "[kicanvas] Canvas2D context unavailable; skip frame",
+                    );
+                } catch (_) {}
+            }
+            return;
         }
 
         ctx.save();

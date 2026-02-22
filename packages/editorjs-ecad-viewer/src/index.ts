@@ -4,6 +4,10 @@ import type { API, BlockTool, ToolConfig } from '@editorjs/editorjs';
 export interface EcadViewerData {
   viewerHostUrl: string;
   sourceUrl: string;
+  /** 存储文件 URL 到用户原始文件名的映射（用于下载与头部展示） */
+  sourceOriginalNames?: Record<string, string>;
+  /** 本次上传时的主原始文件名（URL 命名不稳定时用于下载名兜底） */
+  preferredOriginalFilename?: string;
   isBom?: boolean;
   moduleUrl?: string;
   /**
@@ -112,6 +116,21 @@ async function ensureEcadModule(moduleUrl: string): Promise<void> {
 
   await import(/* @vite-ignore */ moduleUrl);
   loadedModules.add(key);
+
+  // 运行时依赖 ecad-viewer 的公开方法（如 setSourceNameMap / setPreferredOriginalFilename）。
+  // import 完成后理论上已 define，但为了避免偶发的“已加载但未定义”窗口期，这里做一次短等待。
+  try {
+    if (typeof customElements !== 'undefined' && !customElements.get('ecad-viewer')) {
+      await Promise.race([
+        customElements.whenDefined('ecad-viewer'),
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('custom element <ecad-viewer> not defined')), 2000),
+        ),
+      ]);
+    }
+  } catch (_) {
+    // ignore: 失败时后续仍会走可选链调用，不阻塞整体加载流程
+  }
 }
 
 function buildSourceList(sourceUrl: string): string[] {
@@ -133,9 +152,31 @@ function basenameFromUrl(u: string): string {
   }
 }
 
+function buildFallbackSourceNames(urls: string[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const u of urls) {
+    if (!u) continue;
+    map[u] = basenameFromUrl(u);
+  }
+  return map;
+}
+
 function isSupportedLocalFile(name: string): boolean {
   const n = String(name || '').toLowerCase();
-  return n.endsWith('.zip') || n.endsWith('.kicad_sch') || n.endsWith('.kicad_pcb') || n.endsWith('.glb');
+  return (
+    n.endsWith('.zip') ||
+    n.endsWith('.kicad_sch') ||
+    n.endsWith('.kicad_pcb') ||
+    n.endsWith('.kicad_pro') ||
+    n.endsWith('.schdoc') ||
+    n.endsWith('.pcbdoc') ||
+    n.endsWith('.glb')
+  );
+}
+
+function isAltiumLocalFile(name: string): boolean {
+  const n = String(name || '').toLowerCase();
+  return n.endsWith('.schdoc') || n.endsWith('.pcbdoc');
 }
 
 function sleep(ms: number): Promise<void> {
@@ -209,8 +250,6 @@ export default class EcadViewerTool implements BlockTool {
   private readOnly: boolean;
 
   private fileInput?: HTMLInputElement;
-  private openBtn?: HTMLButtonElement;
-  private hintEl?: HTMLElement;
   private mountEl?: HTMLElement;
   private currentViewerEl?: HTMLElement;
   private statusEl?: HTMLElement;
@@ -261,39 +300,32 @@ export default class EcadViewerTool implements BlockTool {
     this.data = {
       viewerHostUrl: normalizedHost,
       sourceUrl: data?.sourceUrl || this.config.defaultSourceUrl || '',
+      sourceOriginalNames:
+        (data?.sourceOriginalNames && typeof data.sourceOriginalNames === 'object'
+          ? { ...data.sourceOriginalNames }
+          : undefined),
       isBom: typeof data?.isBom === 'boolean' ? data.isBom : !!this.config.defaultIsBom,
       moduleUrl,
       viewState: (data as any)?.viewState,
+      preferredOriginalFilename: String(data?.preferredOriginalFilename || ''),
     };
+    if (!this.data.sourceOriginalNames) {
+      const urls = buildSourceList(this.data.sourceUrl || '');
+      this.data.sourceOriginalNames = buildFallbackSourceNames(urls);
+    }
   }
 
   render() {
     const wrapper = document.createElement('div');
     wrapper.className = 'cdx-ecad-viewer';
     try {
-      const toolbar = document.createElement('div');
-      toolbar.className = 'cdx-ecad-viewer__toolbar';
-
-      this.hintEl = document.createElement('div');
-      this.hintEl.className = 'cdx-ecad-viewer__hint';
-      this.hintEl.textContent = '提示：点击“打开文件”选择 ZIP / .kicad_sch / .kicad_pcb / .glb。';
-
-      this.openBtn = document.createElement('button');
-      this.openBtn.type = 'button';
-      this.openBtn.className = 'cdx-ecad-viewer__btn';
-      this.openBtn.textContent = '打开文件';
-      this.openBtn.disabled = this.readOnly;
-
       this.fileInput = document.createElement('input');
       this.fileInput.type = 'file';
       this.fileInput.multiple = true;
-      this.fileInput.accept = '.zip,.kicad_sch,.kicad_pcb,.glb';
+      this.fileInput.accept = '.zip,.kicad_sch,.kicad_pcb,.kicad_pro,.SchDoc,.PcbDoc,.schdoc,.pcbdoc,.glb';
       this.fileInput.style.display = 'none';
 
       if (!this.readOnly) {
-        this.openBtn.addEventListener('click', () => {
-          if (this.fileInput) this.fileInput.click();
-        });
         this.fileInput.addEventListener('change', async () => {
           try {
             const files = Array.from(this.fileInput?.files || []);
@@ -307,8 +339,6 @@ export default class EcadViewerTool implements BlockTool {
         });
       }
 
-      toolbar.append(this.openBtn, this.fileInput, this.hintEl);
-
       this.mountEl = document.createElement('div');
       this.mountEl.className = 'cdx-ecad-viewer__preview';
 
@@ -319,7 +349,7 @@ export default class EcadViewerTool implements BlockTool {
       this.statusEl.appendChild(this.statusTextEl);
       this.mountEl.appendChild(this.statusEl);
 
-      wrapper.append(toolbar, this.mountEl);
+      wrapper.append(this.fileInput, this.mountEl);
 
       this.refreshNativeViewer().catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
@@ -339,6 +369,8 @@ export default class EcadViewerTool implements BlockTool {
       viewerHostUrl: normalizeHost(this.data.viewerHostUrl || ''),
       moduleUrl: this.data.moduleUrl || toModuleUrl(this.data.viewerHostUrl),
       sourceUrl: this.data.sourceUrl || '',
+      sourceOriginalNames: this.data.sourceOriginalNames || {},
+      preferredOriginalFilename: String(this.data.preferredOriginalFilename || ''),
       isBom: !!this.data.isBom,
       viewState: this.data.viewState,
     };
@@ -351,17 +383,47 @@ export default class EcadViewerTool implements BlockTool {
   onReadOnlyChanged(readOnly: boolean) {
     // 只做 UI 交互变更：避免因模式切换触发重载
     this.readOnly = readOnly;
-    if (this.openBtn) this.openBtn.disabled = readOnly;
+    // Editor.js 的 readOnly.toggle() 可能重建块 DOM/实例，也可能复用现有实例。
+    // 这里做轻量对齐，避免模式切换引入 auto-load 竞态或折叠状态被意外重置。
+    try {
+      this.currentViewerEl?.setAttribute?.('auto-load', 'false');
+    } catch (_) {}
+    try {
+      const vs = (this.data as any)?.viewState;
+      if (vs && Object.prototype.hasOwnProperty.call(vs, 'collapsed')) {
+        const anyViewer = this.currentViewerEl as any;
+        if (typeof anyViewer?.setViewerCollapsed === 'function') {
+          anyViewer.setViewerCollapsed(!!vs.collapsed, 'restore');
+        }
+      }
+    } catch (_) {}
   }
 
   private dispatchEditorChange() {
     try {
-      const idx = this.api?.blocks?.getCurrentBlockIndex?.();
-      if (typeof idx !== 'number') return;
-      const block = this.api?.blocks?.getBlockByIndex?.(idx);
-      if (block && typeof (block as any).dispatchChange === 'function') {
-        (block as any).dispatchChange();
+      const blocks = this.api?.blocks as any;
+      if (!blocks) return;
+
+      // 点击 viewer 内部按钮时，EditorJS 可能没有 caret，从而 getCurrentBlockIndex() 取不到。
+      // 这里优先根据 DOM 定位到当前 tool 所在的 block，再调用 dispatchChange()。
+      const holder = (this.mountEl as any)?.closest?.('.ce-block') as HTMLElement | null;
+      if (holder && typeof blocks.getBlocksCount === 'function' && typeof blocks.getBlockByIndex === 'function') {
+        const count = Number(blocks.getBlocksCount() || 0);
+        for (let i = 0; i < count; i++) {
+          const b = blocks.getBlockByIndex(i);
+          const h = b && (b.holder || b.holderNode);
+          if (h === holder || (h && typeof h.contains === 'function' && h.contains(this.mountEl))) {
+            if (typeof b?.dispatchChange === 'function') b.dispatchChange();
+            return;
+          }
+        }
       }
+
+      // 兜底：使用当前 block index
+      const idx = blocks.getCurrentBlockIndex?.();
+      if (typeof idx !== 'number') return;
+      const block = blocks.getBlockByIndex?.(idx);
+      if (block && typeof block.dispatchChange === 'function') block.dispatchChange();
     } catch (_) {}
   }
 
@@ -393,13 +455,38 @@ export default class EcadViewerTool implements BlockTool {
     return url;
   }
 
+  private getCliServerAddr(): string {
+    const w = window as any;
+    return String(w?.cli_server_addr || '').trim();
+  }
+
+  private async convertAltiumFiles(files: File[]): Promise<string[]> {
+    const cli = this.getCliServerAddr();
+    if (!cli) {
+      throw new Error('检测到 Altium 文件，但未配置 cli_server_addr，无法转换 SchDoc/PcbDoc');
+    }
+    const formData = new FormData();
+    for (const f of files) {
+      formData.append('files', f);
+      formData.append('file_names', f.name);
+    }
+    const resp = await fetch(cli, { method: 'POST', body: formData });
+    if (!resp.ok) throw new Error(`Altium 转换失败: ${resp.status}`);
+    const data = await resp.json();
+    const urls = Array.isArray(data?.files) ? data.files.map((u: unknown) => String(u)).filter(Boolean) : [];
+    if (!urls.length) {
+      throw new Error('Altium 转换成功但未返回可加载文件');
+    }
+    return urls;
+  }
+
   private async pickAndUploadFiles(files: File[]) {
     if (this.readOnly) return;
     if (!files || files.length === 0) return;
 
     const supported = files.filter((f) => f && isSupportedLocalFile(f.name));
     if (supported.length === 0) {
-      this.setHint('不支持的文件类型：请选择 ZIP / .kicad_sch / .kicad_pcb / .glb。');
+      this.setHint('不支持的文件类型：请选择 ZIP / .kicad_sch / .kicad_pcb / .kicad_pro / .SchDoc / .PcbDoc / .glb。');
       return;
     }
 
@@ -411,13 +498,52 @@ export default class EcadViewerTool implements BlockTool {
       this.setHint(zip ? `正在上传：${zip.name} ...` : `正在上传：${toUpload.length} 个文件...`);
 
       const urls: string[] = [];
-      for (const f of toUpload) {
-        // eslint-disable-next-line no-await-in-loop
-        const url = await this.uploadAsAttachment(f);
+      const sourceOriginalNames: Record<string, string> = {};
+      const preferredOriginalFilename = toUpload.length > 0 ? String(toUpload[0]!.name || '').trim() : '';
+      if (zip) {
+        // ZIP 维持原样上传，viewer 会按 ZIP 路径加载
+        const url = await this.uploadAsAttachment(zip);
         urls.push(url);
+        sourceOriginalNames[url] = zip.name;
+      } else {
+        const altiumFiles = toUpload.filter((f) => isAltiumLocalFile(f.name));
+        const otherFiles = toUpload.filter((f) => !isAltiumLocalFile(f.name));
+
+        if (altiumFiles.length > 0) {
+          this.setHint(`正在转换 Altium 文件：${altiumFiles.length} 个...`);
+          const convertedUrls = await this.convertAltiumFiles(altiumFiles);
+          urls.push(...convertedUrls);
+          if (convertedUrls.length === altiumFiles.length) {
+            for (let i = 0; i < convertedUrls.length; i++) {
+              const u = convertedUrls[i]!;
+              const f = altiumFiles[i]!;
+              sourceOriginalNames[u] = f.name;
+            }
+          } else if (convertedUrls.length === 1) {
+            sourceOriginalNames[convertedUrls[0]!] =
+              altiumFiles.length === 1
+                ? altiumFiles[0]!.name
+                : `${altiumFiles[0]!.name} 等${altiumFiles.length}个文件`;
+          }
+        }
+
+        for (const f of otherFiles) {
+          // eslint-disable-next-line no-await-in-loop
+          const url = await this.uploadAsAttachment(f);
+          urls.push(url);
+          sourceOriginalNames[url] = f.name;
+        }
       }
 
       this.data.sourceUrl = urls.join(';');
+      this.data.sourceOriginalNames = sourceOriginalNames;
+      this.data.preferredOriginalFilename = preferredOriginalFilename;
+      try {
+        // 调试：确认是否拿到了本地磁盘文件名并写入 block data
+        console.info('[ECAD][upload] local selected filenames =', toUpload.map((f) => f.name));
+        console.info('[ECAD][upload] preferredOriginalFilename =', this.data.preferredOriginalFilename);
+        console.info('[ECAD][upload] sourceOriginalNames =', this.data.sourceOriginalNames);
+      } catch (_) {}
       this.dispatchEditorChange();
       const ok = await this.refreshNativeViewer();
 
@@ -499,6 +625,14 @@ export default class EcadViewerTool implements BlockTool {
 
     // 仅当真正需要渲染/重载时再清空
     const sources = buildSourceList(this.data.sourceUrl);
+    const sourceOriginalNames = this.data.sourceOriginalNames || {};
+    const preferredOriginalFilename = String(this.data.preferredOriginalFilename || '');
+    try {
+      // 调试：确认从 block data 读到的原始文件名映射
+      console.info('[ECAD][render] sources =', sources);
+      console.info('[ECAD][render] preferredOriginalFilename =', preferredOriginalFilename);
+      console.info('[ECAD][render] sourceOriginalNames =', sourceOriginalNames);
+    } catch (_) {}
     const zipOnly = sources.length === 1 && sources[0]!.toLowerCase().endsWith('.zip');
     const height = this.config.iframeHeight || 560;
 
@@ -520,10 +654,39 @@ export default class EcadViewerTool implements BlockTool {
       // 统一使用完整 ecad-viewer（自带 PCB/SCH/BOM/3D 标签页，可切换）
       viewer = safeCreateElement('ecad-viewer');
       this.currentViewerEl = viewer;
+      // 由外层工具统一控制加载时机（避免与 ecad-viewer 内部的 auto load 竞态）
+      try {
+        viewer.setAttribute('auto-load', 'false');
+      } catch (_) {}
       viewer.setAttribute('style', `display:block;width:100%;height:${height}px;border:0;`);
+      (viewer as any).on_open_file = () => {
+        if (!this.readOnly && this.fileInput) this.fileInput.click();
+      };
       // 如需默认打开 BOM，可通过全局 default_page 控制（ecad-viewer 会读取 window.default_page）
       try {
         if (this.data.isBom) (window as any).default_page = 'bom';
+      } catch (_) {}
+
+      // 尽早恢复 viewState（尤其是 collapsed），避免组件初始自动 load_src 时做无谓加载
+      try {
+        const state = (this.data as any)?.viewState;
+        const anyViewer = viewer as any;
+        // 关键：在 append 到 DOM 之前就先折叠起来。
+        // 因为 ecad-viewer 的 initialContentCallback 会 later(() => load_src())，
+        // 若那一刻还是展开态，会直接触发资源加载；而折叠态下 load_src 只会记录 deferred_load。
+        if (
+          state &&
+          Object.prototype.hasOwnProperty.call(state as any, 'collapsed') &&
+          typeof anyViewer?.setViewerCollapsed === 'function'
+        ) {
+          anyViewer.setViewerCollapsed(!!(state as any).collapsed, 'restore');
+        }
+        if (state && typeof anyViewer?.setViewState === 'function') {
+          // setViewState 在 loaded=false 时会内部缓存，且 collapsed 会立即生效
+          void anyViewer.setViewState(state);
+        } else if (state && anyViewer) {
+          (anyViewer as any).viewState = state;
+        }
       } catch (_) {}
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -563,6 +726,29 @@ export default class EcadViewerTool implements BlockTool {
     // 强制触发一次加载（避免某些情况下 initialContentCallback 未触发导致空白）
     try {
       const anyViewer = viewer as any;
+      let allowPersistViewState = false;
+
+      // 尽早监听折叠状态变化：保证“加载中点击折叠”也能立刻收紧高度
+      // 注意：初始化 restore viewState 时会临时关闭 allowPersist，避免把 block 标记为已修改
+      try {
+        const el = viewer as any;
+        el.addEventListener?.('ecad-viewer:view-state-change', (ev: any) => {
+          try {
+            const origin = String(ev?.detail?.origin || '');
+            const next = ev?.detail?.viewState ?? ev?.detail ?? null;
+            if (!next) return;
+            try {
+              this.mountEl?.classList.toggle('is-collapsed', !!(next as any)?.collapsed);
+            } catch (_) {}
+            // setViewState(restore) 可能触发该事件，不应把 block 标记为已修改；
+            // 但用户点击折叠等交互要立刻持久化（即使发生在初始化阶段）
+            if (origin === 'restore') return;
+            if (origin !== 'user' && !allowPersistViewState) return;
+            (this.data as any).viewState = next;
+            this.dispatchEditorChange();
+          } catch (_) {}
+        });
+      } catch (_) {}
 
       // 监听 ecad-viewer 内部的加载状态事件（若存在），用于细粒度状态文案
       try {
@@ -575,9 +761,13 @@ export default class EcadViewerTool implements BlockTool {
           (ev: any) => {
             const msg = ev?.detail?.message || ev?.detail?.text || '';
             if (!msg) return;
-            this.statusBaseText = String(msg);
-            this.updateStatusText();
-            this.setHint(String(msg));
+            this.showStatus(String(msg));
+            // 内部加载完成后自动收起遮罩（展开后延迟加载路径需要）
+            const phase = String(ev?.detail?.phase || '').toLowerCase();
+            if (phase === 'render' || String(msg).includes('渲染完成')) {
+              this.stopStatusTicker();
+              this.hideStatus();
+            }
           },
           { signal: this.statusAbort.signal } as any,
         );
@@ -589,6 +779,58 @@ export default class EcadViewerTool implements BlockTool {
         // 给 updateComplete 一个短等待
         await Promise.race([anyViewer.updateComplete, sleep(300)]);
       }
+      // 在 viewer 首次渲染后再注入文件名元信息：
+      // 1) 避免方法尚不可用时被可选链跳过
+      // 2) 避免 file-meta-change 早于 header 绑定监听导致 label 不刷新
+      try {
+        anyViewer?.setSourceNameMap?.(sourceOriginalNames);
+      } catch (_) {}
+      try {
+        anyViewer?.setPreferredOriginalFilename?.(preferredOriginalFilename);
+      } catch (_) {}
+
+      // 再次确保折叠状态被真实应用到 ecad-viewer：
+      // - 某些环境下早期 setViewState 可能因为元素尚未就绪而未生效
+      // - 这里在首次渲染完成后，根据持久化的 viewState.collapsed 强制对齐一次
+      try {
+        const vs = (this.data as any)?.viewState;
+        if (vs && Object.prototype.hasOwnProperty.call(vs, 'collapsed') && typeof anyViewer?.setViewerCollapsed === 'function') {
+          anyViewer.setViewerCollapsed(!!vs.collapsed, 'restore');
+        }
+      } catch (_) {}
+
+      // 若处于折叠态：不做资源探测、不触发实际加载；展开时由 ecad-viewer 内部自动触发延迟加载
+      const collapsed = !!anyViewer?.getViewerCollapsed?.() || !!(this.data as any)?.viewState?.collapsed;
+      if (collapsed) {
+        try {
+          this.mountEl?.classList.add('is-collapsed');
+        } catch (_) {}
+
+        // 让 ecad-viewer 记录一次“待加载”动作（内部会在展开时执行；折叠态下这里不会发起网络请求）
+        try {
+          const viewerConfirmedCollapsed = !!anyViewer?.getViewerCollapsed?.();
+          if (!viewerConfirmedCollapsed && typeof anyViewer?.setViewerCollapsed === 'function') {
+            anyViewer.setViewerCollapsed(true, 'restore');
+          }
+          if (anyViewer?.getViewerCollapsed?.()) {
+            if (zipOnly && sources[0] && typeof anyViewer.load_window_zip_url === 'function') {
+              void anyViewer.load_window_zip_url(sources[0]);
+            } else if (typeof anyViewer.load_src === 'function') {
+              void anyViewer.load_src();
+            }
+          }
+        } catch (_) {}
+
+        // 折叠态下没有“初始化回放导致的脏标记”问题，允许立刻持久化用户后续操作
+        allowPersistViewState = true;
+        this.stopStatusTicker();
+        this.hideStatus();
+        return true;
+      }
+
+      try {
+        this.mountEl?.classList.remove('is-collapsed');
+      } catch (_) {}
 
       // 资源探测：避免上传后 url 指向 404/HTML，导致内部加载卡住但无明显错误
       if (sources.length >= 1) {
@@ -655,7 +897,12 @@ export default class EcadViewerTool implements BlockTool {
       try {
         const state = (this.data as any)?.viewState;
         if (state && typeof anyViewer?.setViewState === 'function') {
-          await anyViewer.setViewState(state);
+          allowPersistViewState = false;
+          try {
+            await anyViewer.setViewState(state);
+          } finally {
+            allowPersistViewState = true;
+          }
         } else if (state && anyViewer) {
           // 兜底：部分构建版本可能暴露为属性而非方法
           (anyViewer as any).viewState = state;
@@ -664,18 +911,8 @@ export default class EcadViewerTool implements BlockTool {
         console.warn('[ECAD] restore viewState failed:', e);
       }
 
-      // 监听 viewer UI 状态变化并写回 block data，保证下次打开可恢复
-      try {
-        const el = viewer as any;
-        el.addEventListener?.('ecad-viewer:view-state-change', (ev: any) => {
-          try {
-            const next = ev?.detail?.viewState ?? ev?.detail ?? null;
-            if (!next) return;
-            (this.data as any).viewState = next;
-            this.dispatchEditorChange();
-          } catch (_) {}
-        });
-      } catch (_) {}
+      // 初始化流程结束：允许开始持久化用户交互产生的 viewState
+      allowPersistViewState = true;
     } catch (e) {
       console.warn('[ECAD] viewer load failed:', e);
       const msg = e instanceof Error ? e.message : String(e);
@@ -683,24 +920,6 @@ export default class EcadViewerTool implements BlockTool {
       this.stopStatusTicker();
       this.showStatus(`加载失败：${msg}`);
       return false;
-    }
-
-    // 若当前 hint 已经是“上传中/已上传”等用户态提示，则不覆盖；否则显示简短状态
-    const currentHint = (this.hintEl && this.hintEl.textContent) ? String(this.hintEl.textContent) : '';
-    const shouldKeep =
-      currentHint.includes('正在上传') ||
-      currentHint.includes('已上传') ||
-      currentHint.includes('不支持的文件类型');
-    if (!shouldKeep) {
-      if (zipOnly) {
-        this.setHint(`已加载：${basenameFromUrl(sources[0]!)}`);
-      } else if (sources.length === 1 && sources[0]) {
-        this.setHint(`已加载：${basenameFromUrl(sources[0])}`);
-      } else if (sources.length > 1) {
-        this.setHint(`已加载：${sources.length} 个文件`);
-      } else {
-        this.setHint('提示：点击“打开文件”选择 ZIP / .kicad_sch / .kicad_pcb / .glb。');
-      }
     }
 
     this.stopStatusTicker();
@@ -716,6 +935,6 @@ export default class EcadViewerTool implements BlockTool {
   }
 
   private setHint(text: string) {
-    if (this.hintEl) this.hintEl.textContent = text;
+    this.showStatus(text);
   }
 }
